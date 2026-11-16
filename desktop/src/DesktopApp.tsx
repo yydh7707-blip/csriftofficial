@@ -820,7 +820,6 @@ function GameDetectionScreen({ detection, busy, progress, error, steamProfile, i
   return (
     <motion.main className="game-entry-screen" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: reduceMotion ? .1 : .45 }}>
       <div className="game-entry-grid" />
-      <button className="button button-outline game-detection-back" onClick={onContinue}><ChevronLeft size={14} /> BACK TO DASHBOARD</button>
       {isCs2 && <button className="button button-outline game-optimize-trigger" onClick={onOptimize}><Zap size={14} /> OPTIMIZE FOR CS2</button>}
       <div className="game-entry-copy">
         <span className="recommended-badge detection-recommended-badge"><Sparkles size={11} /> RECOMMENDED FIRST STEP</span>
@@ -1755,7 +1754,7 @@ function DesktopApp() {
       <div className="titlebar" data-tauri-drag-region>
         <div className="titlebar-brand" data-tauri-drag-region><span>C</span><b>CSRIFT</b><i /></div>
         <div className="titlebar-center" data-tauri-drag-region><span>{entryScreen ? 'GAME DETECTION' : 'CONTROL CENTER'}</span><ChevronRight size={12} />{entryScreen ? gameProfiles.find((game) => game.id === selectedGameId)?.name ?? 'COUNTER-STRIKE 2' : currentPage.title}</div>
-        <div className="titlebar-right"><span className="local-only-label"><i /> LOCAL SESSION</span><WindowControls /></div>
+        <div className="titlebar-right">{entryScreen && <button className="button button-outline game-detection-back" onClick={() => setEntryScreen(false)}><ChevronLeft size={13} /> BACK TO DASHBOARD</button>}<span className="local-only-label"><i /> LOCAL SESSION</span><WindowControls /></div>
       </div>
 
       {entryScreen ? <GameDetectionScreen detection={gameDetection} busy={detectionBusy} progress={detectionProgress} error={detectionError} steamProfile={steamSession?.profile ?? null} installations={managedGameInstallations} selectedGameId={selectedGameId} steamBusy={steamAuthStage !== null} managedBusy={managedGamesBusy} onSelectGame={setSelectedGameId} onConnectSteam={() => { void startSteamConnection() }} onDisconnectSteam={requestSteamDisconnect} onOpenLibrary={openSteamLibrary} onFind={detectGame} onPick={pickGameFolder} onContinue={() => setEntryScreen(false)} onScan={() => { void startHawkEyeScan() }} onScanManagedGame={() => { void scanSelectedGame() }} onPickManagedGame={(gameId) => { void pickManagedGame(gameId) }} onLaunchGame={(installation) => { void launchManagedGame(installation) }} onOptimize={openOptimization} reduceMotion={motionDisabled} /> : <div className="app-layout">

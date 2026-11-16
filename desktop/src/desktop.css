@@ -505,7 +505,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 1px s
 .license-note { margin: 0; color: #747b84; font-size: 7px; line-height: 1.55; }
 
 .game-entry-screen { position: relative; height: calc(100% - 43px); min-height: 0; display: grid; grid-template-columns: minmax(0,1fr) 420px; align-items: center; gap: clamp(32px,7vw,100px); overflow: hidden; padding: 48px clamp(35px,8vw,112px) 57px; background: radial-gradient(ellipse at 74% 48%,rgba(242,140,40,.075),transparent 40%),#090a0c; }
-.game-detection-back { position: absolute; z-index: 3; top: 16px; left: 22px; min-height: 31px; padding: 0 10px; font-size: 7px; letter-spacing: .07em; }
+.game-detection-back { flex: 0 0 auto; min-height: 28px; padding: 0 9px; font-size: 7px; letter-spacing: .06em; white-space: nowrap; }
 .game-optimize-trigger { position: absolute; z-index: 2; top: 18px; right: 24px; min-height: 31px; padding: 0 10px; font-size: 7px; letter-spacing: .07em; }
 .game-entry-grid, .hawk-backdrop-grid { position: absolute; inset: 0; opacity: .14; background-image: linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px); background-size: 48px 48px; mask-image: radial-gradient(ellipse at center,#000,transparent 78%); pointer-events: none; }
 .game-entry-copy { position: relative; z-index: 1; max-width: 500px; }
@@ -679,7 +679,6 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 1px s
   .game-entry-copy h1 { font-size: 46px; }
   .game-entry-footer { right: 35px; left: 35px; }
   .game-optimize-trigger { top: 12px; right: 14px; }
-  .game-detection-back { top: 10px; left: 12px; }
   .welcome-eye { right: 26px; width: 35%; }
   .dashboard-lower, .fps-overview-grid, .monitor-content-grid { grid-template-columns: 1fr; }
   .game-carousel-footer { grid-template-columns: 1fr; }
