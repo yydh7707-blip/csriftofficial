@@ -2,7 +2,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import {
   Activity, ArrowRight, Bell,
   Check, CheckCircle2, ChevronDown, ChevronRight, CircleAlert, CircleHelp,
-  Cpu, ExternalLink, FileArchive, FileClock, FileCog, FileSearch,
+  ChevronLeft, Cpu, ExternalLink, FileArchive, FileClock, FileCog, FileSearch,
   Gauge, Gamepad2, HardDrive, HeartPulse, History, LayoutDashboard, LoaderCircle,
   Library, LogOut, Maximize2, Minus, Monitor, MoreHorizontal, Network, Pencil, Plus, RefreshCw, RotateCcw,
   Save, Search, Settings2, Shield, ShieldCheck, Sparkles, Square, Trash2,
@@ -13,9 +13,58 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { openUrl } from '@tauri-apps/plugin-opener'
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type ReactNode, type WheelEvent } from 'react'
+import type { PanInfo } from 'framer-motion'
+import { readOnboarding, ONBOARDING_STORAGE_KEY, type AppLanguage, type LegalConsent, type OnboardingProgress } from './onboarding-state'
+
+const OnboardingFlow = lazy(() => import('./onboarding').then((module) => ({ default: module.OnboardingFlow })))
+const LegalDocumentsDialog = lazy(() => import('./onboarding').then((module) => ({ default: module.LegalDocumentsDialog })))
 
 type PageId = 'dashboard' | 'library' | 'fps' | 'network' | 'monitor' | 'config' | 'optimize' | 'recovery' | 'settings'
+type GameId = 'cs2' | 'pubg' | 'valorant' | 'fc-online'
+type GameInstallation = { gameId: GameId; installPath: string; executablePath: string; source: 'STEAM' | 'RIOT' | 'NEXON' | 'MANUAL' }
+type GameProfile = {
+  id: GameId
+  name: string
+  subtitle: string
+  description: string
+  banner: string
+  logo?: string
+  accent: string
+  accentSoft: string
+  platform: string
+}
+
+const gameProfiles: GameProfile[] = [
+  { id: 'cs2', name: 'COUNTER-STRIKE 2', subtitle: 'PRECISION / COMPETITIVE FPS', description: 'Bring your CS2 installation, local configuration and Windows performance tools into one focused workspace.', banner: '/assets/cs2-banner.png', accent: '#f28c28', accentSoft: 'rgba(242,140,40,.12)', platform: 'STEAM · APP 730' },
+  { id: 'pubg', name: 'PUBG: BATTLEGROUNDS', subtitle: 'SURVIVAL / BATTLE ROYALE', description: 'Keep an eye on your local system and connection while your PUBG install stays clearly identified.', banner: '/assets/pubg-banner.png', accent: '#d8a85e', accentSoft: 'rgba(216,168,94,.12)', platform: 'STEAM · APP 578080' },
+  { id: 'valorant', name: 'VALORANT', subtitle: 'TACTICAL / COMPETITIVE FPS', description: 'Locate the Riot client installation and use CSRIFT’s PC-wide monitoring and network tools.', banner: '/assets/valorant-banner.png', accent: '#ff5364', accentSoft: 'rgba(255,83,100,.12)', platform: 'RIOT CLIENT · NON-STEAM' },
+  { id: 'fc-online', name: 'EA SPORTS FC ONLINE', subtitle: 'FOOTBALL / NEXON', description: 'Find your Nexon installation and keep real Windows performance and network signals close at hand.', banner: '/assets/fc-online-banner.png', logo: '/assets/fc-online-mark.png', accent: '#00d879', accentSoft: 'rgba(0,216,121,.12)', platform: 'NEXON · NON-STEAM' },
+]
+
+const MANUAL_GAME_PATHS_KEY = 'csrift-desktop-manual-game-paths-v1'
+
+function readManualGamePaths(): Partial<Record<GameId, string>> {
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem(MANUAL_GAME_PATHS_KEY) ?? '{}')
+    if (stored == null || typeof stored !== 'object' || Array.isArray(stored)) return {}
+    return Object.fromEntries(gameProfiles.flatMap(({ id }) => {
+      const path = (stored as Record<string, unknown>)[id]
+      return typeof path === 'string' && path.trim() ? [[id, path]] : []
+    }))
+  } catch {
+    return {}
+  }
+}
+
+function readSelectedGame(): GameId {
+  try {
+    const stored = localStorage.getItem('csrift-desktop-selected-game-v1')
+    return gameProfiles.some((game) => game.id === stored) ? stored as GameId : 'cs2'
+  } catch {
+    return 'cs2'
+  }
+}
 
 type SystemSnapshot = {
   osName: string | null
@@ -30,6 +79,7 @@ type SystemSnapshot = {
   gpuTemperatureC: number | null
   vramTotalBytes: number | null
   cs2Running: boolean
+  runningGameIds: GameId[]
   activeProcessCount: number
   processes: { name: string; cpuPercent: number; memoryBytes: number }[]
   disks: { name: string; totalBytes: number; availableBytes: number }[]
@@ -43,6 +93,7 @@ type PingResult = {
   received: number
   packetLossPercent: number
   averageLatencyMs: number | null
+  jitterMs: number | null
   latenciesMs: string[]
   measuredAtMs: number
 }
@@ -145,7 +196,7 @@ const navigation: { id: PageId; label: string; icon: LucideIcon; group: string }
 ]
 
 const pageCopy: Record<PageId, { title: string; eyebrow: string; description: string }> = {
-  dashboard: { title: 'Dashboard', eyebrow: 'YOUR ENVIRONMENT, AT A GLANCE', description: 'A clear view of your PC and CS2 setup. No synthetic scores, just the signals your hardware reports.' },
+  dashboard: { title: 'Game Center', eyebrow: 'ONE CONTROL ROOM / YOUR GAMES', description: 'Browse your PC game profiles, verify local installations and open the tools CSRIFT can actually support.' },
   library: { title: 'Game Library', eyebrow: 'STEAM / OWNED GAMES', description: 'Browse games reported by Steam and keep ownership separate from local installation detection.' },
   fps: { title: 'FPS Center', eyebrow: 'FRAME DELIVERY / SYSTEM CONTEXT', description: 'Review CPU pressure, active processes, and the system signals around frame stability.' },
   network: { title: 'Network Lab', eyebrow: 'CONNECTION DIAGNOSTICS', description: 'Measure a real route from your PC. A public resolver is only a comparison point, not your CS2 server.' },
@@ -198,6 +249,7 @@ function useToasts(enabled: boolean) {
     setToasts((items) => [...items.slice(-3), { id, title, message, tone }])
     window.setTimeout(() => setToasts((items) => items.filter((item) => item.id !== id)), 4600)
   }, [])
+
   const dismiss = useCallback((id: number) => setToasts((items) => items.filter((item) => item.id !== id)), [])
   return { toasts, notify, dismiss }
 }
@@ -240,6 +292,10 @@ function EmptyState({ icon: Icon, title, detail }: { icon: LucideIcon; title: st
   return <div className="empty-state"><span className="empty-icon"><Icon size={18} /></span><h3>{title}</h3><p>{detail}</p></div>
 }
 
+function SteamMark() {
+  return <img className="steam-mark" src="/images/steam-logo-circle.png" alt="" aria-hidden="true" />
+}
+
 function AppCard({ className = '', children }: { className?: string; children: ReactNode }) {
   return <section className={`app-card ${className}`}>{children}</section>
 }
@@ -254,7 +310,7 @@ function SteamConnectionCard({ profile, gameCount, loading, onConnect, onLibrary
 }) {
   return (
     <AppCard className={`steam-connection-card ${profile ? 'is-connected' : ''}`}>
-      <span className="steam-card-icon"><Gamepad2 size={19} /></span>
+      <span className="steam-card-icon"><SteamMark /></span>
       <div className="steam-card-copy">
         <span className="eyebrow"><i /> STEAM / GAME LIBRARY</span>
         <h3>{profile ? `CONNECTED TO STEAM · ${profile.personaName}` : 'Connect your Steam account.'}</h3>
@@ -263,62 +319,174 @@ function SteamConnectionCard({ profile, gameCount, loading, onConnect, onLibrary
       {profile ? <>
         <span className="steam-connected-pill"><i /> CONNECTED</span>
         <button className="button button-outline" onClick={onLibrary} disabled={loading}><Library size={13} /> {loading ? 'SYNCING…' : 'OPEN LIBRARY'}</button>
-        <button className="steam-disconnect-button" onClick={onDisconnect}><LogOut size={13} /> DISCONNECT</button>
-      </> : <button className="button button-primary steam-connect-button" onClick={onConnect}><Gamepad2 size={15} /> CONNECT YOUR STEAM ACCOUNT <ArrowRight size={14} /></button>}
+        <button className="steam-disconnect-button" title="Log out of CSRIFT. Your Steam browser session stays unchanged." aria-label="Log out of CSRIFT" onClick={onDisconnect}><LogOut size={13} /> LOG OUT</button>
+      </> : <button className="button button-primary steam-connect-button" onClick={onConnect}><SteamMark /> CONNECT YOUR STEAM ACCOUNT <ArrowRight size={14} /></button>}
     </AppCard>
+  )
+}
+
+function GameCarousel({ snapshot, installations, selectedGameId, gameDetection, reduceMotion, scanning, onSelectGame, onScanGames, onPickGame, onLaunchGame, onPage, onGameDetection }: {
+  snapshot: SystemSnapshot | null
+  installations: GameInstallation[]
+  selectedGameId: GameId
+  gameDetection: GameDetection | null
+  reduceMotion: boolean
+  scanning: boolean
+  onSelectGame: (gameId: GameId) => void
+  onScanGames: () => void
+  onPickGame: (gameId: GameId) => void
+  onLaunchGame: (installation: GameInstallation) => void
+  onPage: (page: PageId) => void
+  onGameDetection: () => void
+}) {
+  const activeIndex = Math.max(0, gameProfiles.findIndex((game) => game.id === selectedGameId))
+  const game = gameProfiles[activeIndex]
+  const [slideDirection, setSlideDirection] = useState(1)
+  const wheelCooldown = useRef<number | null>(null)
+  const installation = installations.find((item) => item.gameId === game.id)
+    ?? (game.id === 'cs2' && gameDetection?.detected && gameDetection.installPath && gameDetection.executableFound
+      ? { gameId: 'cs2', installPath: gameDetection.installPath, executablePath: gameDetection.installPath, source: 'MANUAL' as const }
+      : undefined)
+  const running = snapshot?.runningGameIds.includes(game.id) === true
+  const profileStyle = { '--game-accent': game.accent, '--game-accent-soft': game.accentSoft } as CSSProperties
+  const move = (direction: -1 | 1) => {
+    setSlideDirection(direction)
+    const next = (activeIndex + direction + gameProfiles.length) % gameProfiles.length
+    onSelectGame(gameProfiles[next].id)
+  }
+  const handleDragEnd = (_event: MouseEvent | TouchEvent | PointerEvent, info: PanInfo) => {
+    if (info.offset.x < -72 || info.velocity.x < -520) move(1)
+    if (info.offset.x > 72 || info.velocity.x > 520) move(-1)
+  }
+  const handleHorizontalWheel = (event: WheelEvent<HTMLDivElement>) => {
+    if (Math.abs(event.deltaX) < 20 || Math.abs(event.deltaX) < Math.abs(event.deltaY)) return
+    event.preventDefault()
+    if (wheelCooldown.current != null) return
+    move(event.deltaX > 0 ? 1 : -1)
+    wheelCooldown.current = window.setTimeout(() => { wheelCooldown.current = null }, 320)
+  }
+  useEffect(() => {
+    for (const profile of gameProfiles) {
+      const image = new Image()
+      image.src = profile.banner
+    }
+  }, [])
+  useEffect(() => () => {
+    if (wheelCooldown.current != null) window.clearTimeout(wheelCooldown.current)
+  }, [])
+
+  return (
+    <section className="game-hub" style={profileStyle} aria-label="Game management">
+      <div className="game-hub-heading"><div><span className="eyebrow"><i /> CSRIFT / GAME MANAGEMENT</span><h2>ONE CONTROL ROOM.<br /><span>YOUR GAMES.</span></h2></div><span className="game-hub-count">{String(activeIndex + 1).padStart(2, '0')} <i /> {String(gameProfiles.length).padStart(2, '0')}</span></div>
+      <div className="game-carousel-shell" onWheel={handleHorizontalWheel}>
+        <button className="game-carousel-arrow game-carousel-prev" onClick={() => move(-1)} aria-label="Previous game"><ChevronLeft size={19} /></button>
+        <AnimatePresence mode="wait" initial={false}>
+        <motion.div
+          className="game-carousel-banner"
+          key={game.id}
+          drag="x"
+          dragConstraints={{ left: 0, right: 0 }}
+          dragElastic={.06}
+          onDragEnd={handleDragEnd}
+          whileDrag={{ cursor: 'grabbing', scale: .995 }}
+          initial={{ opacity: reduceMotion ? 1 : .76, x: reduceMotion ? 0 : slideDirection * 18 }}
+          animate={{ opacity: 1, x: 0 }}
+          exit={{ opacity: reduceMotion ? 1 : 0, x: reduceMotion ? 0 : slideDirection * -18 }}
+          transition={{ duration: reduceMotion ? .08 : .32, ease: [.22, .7, .2, 1] }}
+          style={{ backgroundImage: `linear-gradient(90deg,rgba(6,8,10,.42),rgba(6,8,10,.04) 86%),url("${game.banner}")` }}
+        >
+          <div className="game-carousel-copy">
+            <span className="game-platform-label">{game.logo ? <img src={game.logo} alt="" /> : <i />}{game.platform}</span>
+            <span className="game-carousel-subtitle">{game.subtitle}</span>
+            <h3>{game.name}</h3>
+            <p>{game.description}</p>
+            <div className="game-carousel-status">
+              <span className={running ? 'is-running' : installation ? 'is-installed' : ''}><i />{running ? 'RUNNING' : installation ? 'INSTALLED · VERIFIED' : 'NOT DETECTED'}</span>
+              {installation && <code title={installation.installPath}>{installation.installPath}</code>}
+            </div>
+            <div className="game-carousel-actions">
+              <button className="button button-primary game-hub-primary" onClick={installation ? () => onLaunchGame(installation) : onScanGames} disabled={scanning}>{scanning ? <LoaderCircle size={14} className="spin" /> : <Gamepad2 size={15} />}{scanning ? 'SEARCHING…' : installation ? 'LAUNCH GAME' : 'FIND THIS GAME'}{!scanning && <ArrowRight size={14} />}</button>
+              {game.id === 'cs2'
+                ? <button className="button button-outline" onClick={onGameDetection}><Search size={14} /> GAME DETECTION</button>
+                : <button className="button button-outline" onClick={() => onPickGame(game.id)}><ExternalLink size={14} /> SELECT GAME EXE</button>}
+            </div>
+          </div>
+          <span className="game-banner-index">CSRIFT&nbsp; / &nbsp;{game.id.toUpperCase()}</span>
+          <span className="game-banner-platform">{game.platform}</span>
+        </motion.div>
+        </AnimatePresence>
+        <button className="game-carousel-arrow game-carousel-next" onClick={() => move(1)} aria-label="Next game"><ChevronRight size={19} /></button>
+      </div>
+      <div className="game-carousel-footer">
+        <div className="game-carousel-dots" role="tablist" aria-label="Select a game">{gameProfiles.map((profile, index) => <button key={profile.id} className={profile.id === game.id ? 'is-active' : ''} style={{ '--dot-accent': profile.accent } as CSSProperties} onClick={() => { setSlideDirection(index >= activeIndex ? 1 : -1); onSelectGame(profile.id) }} role="tab" aria-selected={profile.id === game.id} aria-label={`Show ${profile.name}`}><span />{String(index + 1).padStart(2, '0')}<small>{profile.name}</small></button>)}</div>
+        <div className="game-hub-tools">
+          <span className="game-hub-tool-label">AVAILABLE TOOLS</span>
+          <button onClick={() => onPage('monitor')}><Activity size={13} />SYSTEM MONITOR</button>
+          <button onClick={() => onPage('fps')}><Gauge size={13} />FRAME / SYSTEM</button>
+          <button onClick={() => onPage('network')}><Network size={13} />NETWORK LAB</button>
+          {game.id === 'cs2' && <button onClick={() => onPage('config')}><FileCog size={13} />CS2 CONFIG</button>}
+          {game.id !== 'cs2' && <span className="game-tools-note">No game files or graphics settings are modified.</span>}
+        </div>
+      </div>
+      <div className="game-hub-management">
+        <div><span className="eyebrow"><i /> GAME-SCOPED CONTROL</span><b>{game.name}</b><small>{game.id === 'cs2' ? 'Config backups, system tools, network diagnostics and local detection.' : 'Windows telemetry, measured network diagnostics, installation path and verified launch only.'}</small></div>
+        <div><span className="game-hub-capability"><CheckCircle2 size={12} /> SYSTEM MONITOR</span><span className="game-hub-capability"><CheckCircle2 size={12} /> NETWORK / JITTER</span><span className="game-hub-capability"><CheckCircle2 size={12} /> INSTALL / LAUNCH</span>{game.id === 'cs2' && <span className="game-hub-capability"><CheckCircle2 size={12} /> CONFIG BACKUP</span>}</div>
+        <p>In-game FPS and graphics telemetry are not read by CSRIFT. Frame stability is shown through measured Windows CPU / memory samples; no FPS value is estimated.</p>
+      </div>
+    </section>
   )
 }
 
 function DashboardPage({
   snapshot, history, latestPing, config, gameDetection, steamSession, steamLibrary,
-  steamLibraryLoading, onPage, onGameDetection, onConnectSteam, onOpenLibrary, onDisconnectSteam,
+  steamLibraryLoading, installations, selectedGameId, onSelectGame, onScanGames, onPickGame,
+  onLaunchGame, onPage, onGameDetection, onConnectSteam, onOpenLibrary, onDisconnectSteam, reduceMotion, scanning,
 }: {
   snapshot: SystemSnapshot | null; history: number[]; latestPing: PingResult | null; config: ConfigStatus | null; gameDetection: GameDetection | null
   steamSession: SteamSession | null; steamLibrary: SteamLibrary | null; steamLibraryLoading: boolean
+  installations: GameInstallation[]; selectedGameId: GameId; onSelectGame: (gameId: GameId) => void
+  reduceMotion: boolean
+  scanning: boolean
+  onScanGames: () => void; onPickGame: (gameId: GameId) => void; onLaunchGame: (installation: GameInstallation) => void
   onPage: (page: PageId) => void; onGameDetection: () => void; onConnectSteam: () => void
   onOpenLibrary: () => void; onDisconnectSteam: () => void
 }) {
   const systemClear = snapshot != null && snapshot.cpuUsagePercent != null && snapshot.cpuUsagePercent < 85 && snapshot.memoryUsagePercent != null && snapshot.memoryUsagePercent < 92
+  const selectedGame = gameProfiles.find((game) => game.id === selectedGameId) ?? gameProfiles[0]
+  const steamSupported = selectedGame.id === 'cs2' || selectedGame.id === 'pubg'
   return (
     <div className="page-stack">
-      <section className="welcome-panel">
-        <div className="welcome-grid" />
-        <div className="welcome-copy">
-          <span className="eyebrow"><i /> PERSONAL / LOCAL / PRIVATE</span>
-          <h1>WELCOME TO <span>CSRIFT.</span></h1>
-          <p>Your CS2 environment, under control.</p>
-          <div className="welcome-pills"><span><Check size={12} /> LOCAL-FIRST</span><span><ShieldCheck size={12} /> ALWAYS YOUR CHOICE</span></div>
-        </div>
-        <EyeMark className="welcome-eye" />
-        <div className="welcome-corner">EST. 2026&nbsp;&nbsp; / &nbsp;&nbsp; BUILD 0.1.0</div>
-      </section>
+      <GameCarousel
+        snapshot={snapshot}
+        installations={installations}
+        selectedGameId={selectedGameId}
+        gameDetection={gameDetection}
+        reduceMotion={reduceMotion}
+        scanning={scanning}
+        onSelectGame={onSelectGame}
+        onScanGames={onScanGames}
+        onPickGame={onPickGame}
+        onLaunchGame={onLaunchGame}
+        onPage={onPage}
+        onGameDetection={onGameDetection}
+      />
 
-      <SteamConnectionCard
+      {steamSupported && <SteamConnectionCard
         profile={steamSession?.profile ?? null}
         gameCount={steamLibrary?.games.length ?? null}
         loading={steamLibraryLoading}
         onConnect={onConnectSteam}
         onLibrary={onOpenLibrary}
         onDisconnect={onDisconnectSteam}
-      />
+      />}
 
       <div className="status-ribbon">
         <span className={`system-beacon ${systemClear ? 'is-good' : 'is-review'}`}><i /></span>
         <div><strong>{snapshot ? systemClear ? 'SYSTEM IN RANGE' : 'SYSTEM CHECK' : 'CONNECTING TO WINDOWS'}</strong><small>{snapshot?.osName ?? 'Reading local hardware signals'}</small></div>
         <span className="ribbon-divider" />
-        <span className="cs-status"><i className={snapshot?.cs2Running ? 'is-active' : ''} /><span>CS2 {snapshot ? snapshot.cs2Running ? 'RUNNING' : 'NOT RUNNING' : 'CHECKING'}</span></span>
+        <span className="cs-status"><i className={snapshot?.runningGameIds.includes(selectedGame.id) ? 'is-active' : ''} /><span>{selectedGame.name} {snapshot ? snapshot.runningGameIds.includes(selectedGame.id) ? 'RUNNING' : 'NOT RUNNING' : 'CHECKING'}</span></span>
         <span className="ribbon-spacer" />
         <span className="local-tag"><ShieldCheck size={13} /> YOUR PC ONLY</span>
-      </div>
-
-      <div className="detection-featured-wrap">
-        <span className="recommended-badge"><Sparkles size={11} /> RECOMMENDED</span>
-        <button className="detection-featured-card" onClick={onGameDetection} aria-label="Open recommended Game Detection">
-          <span className="detection-featured-icon"><Gamepad2 size={20} /></span>
-          <span className="detection-featured-copy"><b>GAME DETECTION</b><small>Find and verify your CS2 installation before scanning.</small></span>
-          <span className={`detection-featured-status ${gameDetection?.detected ? 'is-found' : ''}`}><i />{gameDetection?.detected ? 'CS2 VERIFIED' : 'START HERE'}</span>
-          <span className="detection-featured-action">OPEN GAME DETECTION <ArrowRight size={15} /></span>
-        </button>
       </div>
 
       <div className="metric-grid">
@@ -340,7 +508,7 @@ function DashboardPage({
         <AppCard className="quick-card">
           <div className="card-heading"><div><span className="eyebrow"><i /> QUICK ACCESS</span><h3>Pick up where you left off.</h3></div></div>
           <button className="quick-row" onClick={() => onPage('network')}><span className="quick-icon"><Network size={15} /></span><span><b>NETWORK LAB</b><small>{latestPing ? `${latestPing.target} · ${latestPing.received}/${latestPing.sent} responses` : 'Run a real connection check'}</small></span><ChevronRight size={15} /></button>
-          <button className="quick-row" onClick={() => onPage('config')}><span className="quick-icon"><FileCog size={15} /></span><span><b>CS2 CONFIG</b><small>{config?.detected ? `${config.files.length} supported files found` : 'Check for local settings'}</small></span><ChevronRight size={15} /></button>
+          {selectedGame.id === 'cs2' && <button className="quick-row" onClick={() => onPage('config')}><span className="quick-icon"><FileCog size={15} /></span><span><b>CS2 CONFIG</b><small>{config?.detected ? `${config.files.length} supported files found` : 'Check for local settings'}</small></span><ChevronRight size={15} /></button>}
           <button className="quick-row" onClick={() => onPage('optimize')}><span className="quick-icon"><Sparkles size={15} /></span><span><b>WINDOWS OPTIMIZE</b><small>Review before you make a change</small></span><ChevronRight size={15} /></button>
         </AppCard>
       </div>
@@ -387,7 +555,7 @@ function SteamLibraryPage({ session, library, installedGames, installCheckComple
         title="Your library, on your terms."
         detail="Steam ownership comes from your account. Local installation is verified separately on this PC."
         action={session
-          ? <div className="toolbar-actions"><button className="button button-outline" onClick={onSync} disabled={loading}><RefreshCw size={13} className={loading ? 'spin' : ''} /> {loading ? 'SYNCING…' : 'SYNC LIBRARY'}</button><button className="button button-outline" onClick={onDisconnect}><LogOut size={13} /> DISCONNECT</button></div>
+          ? <div className="toolbar-actions"><button className="button button-outline" onClick={onSync} disabled={loading}><RefreshCw size={13} className={loading ? 'spin' : ''} /> {loading ? 'SYNCING…' : 'SYNC LIBRARY'}</button><button className="button button-outline" title="Revoke the CSRIFT session; this does not sign you out of Steam Community." aria-label="Log out of CSRIFT" onClick={onDisconnect}><LogOut size={13} /> LOG OUT</button></div>
           : <button className="button button-primary" onClick={onConnect}><Gamepad2 size={14} /> CONNECT YOUR STEAM ACCOUNT</button>}
       />
       <AppCard className="local-steam-games">
@@ -488,7 +656,7 @@ function NetworkPage({ latestPing, pingHistory, onPing }: { latestPing: PingResu
     <div className="page-stack">
       <SectionTitle overline="CONNECTION DIAGNOSTICS" title="Test your route." detail="Measure actual ICMP responses from this PC. Results reflect this target only—not your CS2 game server." />
       <div className="network-grid">
-        <AppCard className="ping-card"><div className="card-heading"><div><span className="eyebrow"><i /> LIVE TEST / IPV4 + IPV6</span><h3>Run a real ping.</h3></div><span className="ping-icon"><Wifi size={18} /></span></div><form className="ping-form" onSubmit={(event) => void submit(event)}><label htmlFor="ping-target">IP ADDRESS</label><div className="ping-input-row"><div className="target-prefix">IP</div><input id="ping-target" value={target} onChange={(event) => setTarget(event.target.value)} placeholder="1.1.1.1" maxLength={45} spellCheck={false} /><button className="button button-primary" type="submit" disabled={busy || !target.trim()}>{busy ? <LoaderCircle size={15} className="spin" /> : <Activity size={15} />} {busy ? 'TESTING' : 'RUN TEST'} <ArrowRight size={14} /></button></div></form><p className="ping-helper">Sends 4 standard ICMP echo requests using Windows <code>ping</code>. No server connection is made.</p>{error && <div className="inline-error"><CircleAlert size={14} />{error}</div>}{latestPing &&         <div className="ping-results"><div className="ping-result-main"><span>AVERAGE RESPONSE</span><strong>{latestPing.averageLatencyMs == null ? latestPing.received ? '<1 ms' : 'No reply' : `${latestPing.averageLatencyMs.toFixed(1)} ms`}</strong><small>{latestPing.target} · {latestPing.received}/{latestPing.sent} responses</small></div><div className="ping-result-stats"><div><span>PACKET LOSS</span><b>{latestPing.packetLossPercent}%</b></div><div><span>RESPONSE STATUS</span><b className={latestPing.packetLossPercent === 0 ? 'status-text-good' : 'status-text-warn'}>{latestPing.packetLossPercent === 0 ? 'ALL REPLIED' : latestPing.received ? 'PACKET LOSS' : 'UNREACHABLE'}</b></div></div></div>}</AppCard>
+        <AppCard className="ping-card"><div className="card-heading"><div><span className="eyebrow"><i /> LIVE TEST / IPV4 + IPV6</span><h3>Run a real ping.</h3></div><span className="ping-icon"><Wifi size={18} /></span></div><form className="ping-form" onSubmit={(event) => void submit(event)}><label htmlFor="ping-target">IP ADDRESS</label><div className="ping-input-row"><div className="target-prefix">IP</div><input id="ping-target" value={target} onChange={(event) => setTarget(event.target.value)} placeholder="1.1.1.1" maxLength={45} spellCheck={false} /><button className="button button-primary" type="submit" disabled={busy || !target.trim()}>{busy ? <LoaderCircle size={15} className="spin" /> : <Activity size={15} />} {busy ? 'TESTING' : 'RUN TEST'} <ArrowRight size={14} /></button></div></form><p className="ping-helper">Sends 4 standard ICMP echo requests using Windows <code>ping</code>. Jitter is the average absolute change between measured replies; resolver ping is not a game-server ping.</p>{error && <div className="inline-error"><CircleAlert size={14} />{error}</div>}{latestPing && <div className="ping-results"><div className="ping-result-main"><span>AVERAGE RESPONSE</span><strong>{latestPing.averageLatencyMs == null ? latestPing.received ? '<1 ms' : 'No reply' : `${latestPing.averageLatencyMs.toFixed(1)} ms`}</strong><small>{latestPing.target} · {latestPing.received}/{latestPing.sent} responses</small></div><div className="ping-result-stats"><div><span>PACKET LOSS</span><b>{latestPing.packetLossPercent}%</b></div><div><span>JITTER</span><b>{latestPing.jitterMs == null ? 'NOT ENOUGH SAMPLES' : `${latestPing.jitterMs.toFixed(1)} ms`}</b></div><div><span>RESPONSE STATUS</span><b className={latestPing.packetLossPercent === 0 ? 'status-text-good' : 'status-text-warn'}>{latestPing.packetLossPercent === 0 ? 'ALL REPLIED' : latestPing.received ? 'PACKET LOSS' : 'UNREACHABLE'}</b></div></div></div>}</AppCard>
         <AppCard className="network-chart-card"><div className="card-heading"><div><span className="eyebrow"><i /> MEASURED REPLIES / THIS SESSION</span><h3>Response history</h3></div><span className="live-tag"><i /> {pingHistory.length ? `${pingHistory.length} TESTS` : 'EMPTY'}</span></div>{resultValues.length > 1 ? <div className="network-history-chart"><Sparkline values={resultValues} color="#ffb347" /><div className="chart-axis"><span>EARLIEST REPLY</span><span>{latestPing ? timeLabel(latestPing.measuredAtMs) : ''}</span></div></div> : <EmptyState icon={Activity} title="No measurements yet" detail="Run a ping to build a graph from actual replies. This graph never generates sample data." />}<div className="target-note"><CircleHelp size={13} /><span>Ping to 1.1.1.1 is not equivalent to ping to a CS2 match server.</span></div></AppCard>
       </div>
       <div className="network-bottom-grid">
@@ -570,7 +738,12 @@ function RecoveryPage({ backups, profiles, activity, onRefresh, onRestore, onOpe
   )
 }
 
-function SettingsPage({ settings, dataPath, saveSettings, notify }: { settings: DesktopSettings; dataPath: string | null; saveSettings: (next: DesktopSettings) => Promise<void>; notify: (title: string, message: string, tone?: Toast['tone']) => void }) {
+function SettingsPage({ settings, dataPath, saveSettings, notify, language, onLanguageChange, onOpenLegal }: { settings: DesktopSettings; dataPath: string | null; saveSettings: (next: DesktopSettings) => Promise<void>; notify: (title: string, message: string, tone?: Toast['tone']) => void; language: AppLanguage; onLanguageChange: (language: AppLanguage) => void; onOpenLegal: (document: 'privacy' | 'terms') => void }) {
+  const languageCopy = {
+    en: { title: 'Language', detail: 'Language for first-run setup and legal documents.', privacy: 'Privacy Policy', terms: 'Terms of Service' },
+    ko: { title: '언어', detail: '최초 설정과 법적 문서에 사용할 언어입니다.', privacy: '개인정보 처리방침', terms: '서비스 이용약관' },
+    ja: { title: '言語', detail: '初回設定と法的文書で使用する言語です。', privacy: 'プライバシーポリシー', terms: '利用規約' },
+  }[language]
   const update = async (key: keyof DesktopSettings, value: DesktopSettings[keyof DesktopSettings]) => {
     const next = { ...settings, [key]: value } as DesktopSettings
     try {
@@ -583,7 +756,7 @@ function SettingsPage({ settings, dataPath, saveSettings, notify }: { settings: 
   return (
     <div className="page-stack">
       <SectionTitle overline="YOUR APP / YOUR PREFERENCES" title="Make CSRIFT yours." detail="Preferences are stored in a local JSON file on this PC. No account or synchronization service is used." />
-      <div className="settings-columns"><AppCard className="settings-card"><div className="card-heading"><div><span className="eyebrow"><i /> EXPERIENCE</span><h3>Your workspace.</h3></div><Settings2 size={17} className="muted-icon" /></div><SettingRow icon={Monitor} title="Accent finish" detail="A restrained highlight, used consistently across the app."><select className="setting-select" value={settings.accent} onChange={(event) => void update('accent', event.target.value as DesktopSettings['accent'])}><option value="ember">Ember · CSRIFT orange</option><option value="amber">Amber · warm gold</option></select></SettingRow><SettingRow icon={Sparkles} title="Intro animation" detail="Show the short branded introduction when the app launches."><Toggle checked={settings.introEnabled} onChange={(checked) => void update('introEnabled', checked)} label="Intro animation" /></SettingRow><SettingRow icon={Activity} title="Reduce motion" detail="Use shorter transitions and suppress decorative movement."><Toggle checked={settings.reduceMotion} onChange={(checked) => void update('reduceMotion', checked)} label="Reduce motion" /></SettingRow><SettingRow icon={Bell} title="In-app notifications" detail="Choose whether local actions create toast notifications."><Toggle checked={settings.notificationsEnabled} onChange={(checked) => void update('notificationsEnabled', checked)} label="In-app notifications" /></SettingRow></AppCard><AppCard className="settings-card"><div className="card-heading"><div><span className="eyebrow"><i /> APPLICATION</span><h3>Local by design.</h3></div><ShieldCheck size={17} className="muted-icon" /></div><SettingRow icon={Activity} title="Language" detail="CSRIFT is currently available in English. Korean support is planned."><select className="setting-select" value="en" disabled aria-label="Application language"><option value="en">English</option></select></SettingRow><SettingRow icon={Zap} title="Start on sign-in" detail="Automatic startup integration is not configured in this preview build."><span className="planned-badge">NOT CONFIGURED</span></SettingRow><SettingRow icon={HardDrive} title="Application data" detail={dataPath ?? 'Reading the local CSRIFT application-data folder.'}><span className="local-data-badge"><ShieldCheck size={12} /> LOCAL</span></SettingRow><div className="about-block"><div className="about-logo"><span>C</span><div><b>CSRIFT</b><small>YOUR ENVIRONMENT. UNDER CONTROL.</small></div></div><div className="about-version"><span>APPLICATION VERSION</span><b>0.1.0 · PREVIEW</b><span>CS2-INDEPENDENT / WINDOWS 10 + 11</span></div></div><p className="license-note">Not affiliated with, endorsed by, or sponsored by Valve Corporation.</p></AppCard></div>
+      <div className="settings-columns"><AppCard className="settings-card"><div className="card-heading"><div><span className="eyebrow"><i /> EXPERIENCE</span><h3>Your workspace.</h3></div><Settings2 size={17} className="muted-icon" /></div><SettingRow icon={Monitor} title="Accent finish" detail="A restrained highlight, used consistently across the app."><select className="setting-select" value={settings.accent} onChange={(event) => void update('accent', event.target.value as DesktopSettings['accent'])}><option value="ember">Ember · CSRIFT orange</option><option value="amber">Amber · warm gold</option></select></SettingRow><SettingRow icon={Sparkles} title="Intro animation" detail="Show the short branded introduction when the app launches."><Toggle checked={settings.introEnabled} onChange={(checked) => void update('introEnabled', checked)} label="Intro animation" /></SettingRow><SettingRow icon={Activity} title="Reduce motion" detail="Use shorter transitions and suppress decorative movement."><Toggle checked={settings.reduceMotion} onChange={(checked) => void update('reduceMotion', checked)} label="Reduce motion" /></SettingRow><SettingRow icon={Bell} title="In-app notifications" detail="Choose whether local actions create toast notifications."><Toggle checked={settings.notificationsEnabled} onChange={(checked) => void update('notificationsEnabled', checked)} label="In-app notifications" /></SettingRow></AppCard><AppCard className="settings-card"><div className="card-heading"><div><span className="eyebrow"><i /> APPLICATION</span><h3>Local by design.</h3></div><ShieldCheck size={17} className="muted-icon" /></div><SettingRow icon={Activity} title={languageCopy.title} detail={languageCopy.detail}><select className="setting-select" value={language} onChange={(event) => onLanguageChange(event.target.value as AppLanguage)} aria-label={languageCopy.title}><option value="en">English</option><option value="ko">한국어</option><option value="ja">日本語</option></select></SettingRow><div className="settings-legal-links"><span>LEGAL DOCUMENTS / 2026-11-16</span><button onClick={() => onOpenLegal('privacy')}>{languageCopy.privacy} <ChevronRight size={13} /></button><button onClick={() => onOpenLegal('terms')}>{languageCopy.terms} <ChevronRight size={13} /></button></div><SettingRow icon={Zap} title="Start on sign-in" detail="Automatic startup integration is not configured in this preview build."><span className="planned-badge">NOT CONFIGURED</span></SettingRow><SettingRow icon={HardDrive} title="Application data" detail={dataPath ?? 'Reading the local CSRIFT application-data folder.'}><span className="local-data-badge"><ShieldCheck size={12} /> LOCAL</span></SettingRow><div className="about-block"><div className="about-logo"><span>C</span><div><b>CSRIFT</b><small>YOUR ENVIRONMENT. UNDER CONTROL.</small></div></div><div className="about-version"><span>APPLICATION VERSION</span><b>0.1.0 · PREVIEW</b><span>CS2-INDEPENDENT / WINDOWS 10 + 11</span></div></div><p className="license-note">Not affiliated with, endorsed by, or sponsored by Valve Corporation.</p><p className="settings-copyright">© 2026 CSRIFT. All rights reserved.</p></AppCard></div>
     </div>
   )
 }
@@ -612,58 +785,81 @@ function BootIntro({ onSkip, reduceMotion }: { onSkip: () => void; reduceMotion:
   return <motion.div className="boot-intro" initial={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: reduceMotion ? 0.15 : 0.42 }}><motion.div className="intro-eye" initial={{ opacity: 0, scale: reduceMotion ? 1 : .97, y: reduceMotion ? 0 : 7 }} animate={{ opacity: .9, scale: 1, y: 0 }} transition={{ duration: reduceMotion ? .12 : .42, ease: [0.22, 1, 0.36, 1] }}><img src="/images/csrift-eyes-cutout.png" alt="" fetchPriority="high" decoding="async" /></motion.div><motion.div className="intro-wordmark" initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: reduceMotion ? 0 : .16, duration: reduceMotion ? .12 : .28, ease: 'easeOut' }}><span>C</span><b>CSRIFT</b></motion.div><div className="intro-progress"><i /></div><button className="intro-skip" onClick={onSkip}>SKIP INTRO <ArrowRight size={13} /></button></motion.div>
 }
 
-function GameDetectionScreen({ detection, busy, progress, error, steamProfile, onConnectSteam, onDisconnectSteam, onOpenLibrary, steamBusy, onFind, onPick, onContinue, onScan, onOptimize, reduceMotion }: {
+function GameDetectionScreen({ detection, busy, progress, error, steamProfile, installations, selectedGameId, steamBusy, managedBusy, onSelectGame, onConnectSteam, onDisconnectSteam, onOpenLibrary, onFind, onPick, onScan, onScanManagedGame, onPickManagedGame, onLaunchGame, onContinue, onOptimize, reduceMotion }: {
   detection: GameDetection | null
   busy: boolean
   progress: ScanProgress | null
   error: string | null
   steamProfile: SteamProfile | null
+  installations: GameInstallation[]
+  selectedGameId: GameId
   steamBusy: boolean
+  managedBusy: boolean
+  onSelectGame: (gameId: GameId) => void
   onConnectSteam: () => void
   onDisconnectSteam: () => void
   onOpenLibrary: () => void
   onFind: (path?: string) => Promise<void>
   onPick: () => Promise<void>
-  onContinue: () => void
   onScan: () => void
+  onScanManagedGame: () => void
+  onPickManagedGame: (gameId: GameId) => void
+  onLaunchGame: (installation: GameInstallation) => void
+  onContinue: () => void
   onOptimize: () => void
   reduceMotion: boolean
 }) {
   const [posterUnavailable, setPosterUnavailable] = useState(false)
-  const detected = detection?.detected === true
+  const game = gameProfiles.find((profile) => profile.id === selectedGameId) ?? gameProfiles[0]
+  const isCs2 = game.id === 'cs2'
+  const installation = installations.find((item) => item.gameId === game.id) ?? null
+  const detected = isCs2 ? detection?.detected === true : installation !== null
+  const scanBusy = isCs2 ? busy : managedBusy
+  const scanError = isCs2 ? error : null
+  const title = game.id === 'fc-online' ? 'EA SPORTS FC ONLINE' : game.id === 'pubg' ? 'PUBG: BATTLEGROUNDS' : game.name
   return (
     <motion.main className="game-entry-screen" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: reduceMotion ? .1 : .45 }}>
       <div className="game-entry-grid" />
-      <button className="button button-outline game-optimize-trigger" onClick={onOptimize}><Zap size={14} /> OPTIMIZE FOR CS2</button>
+      <button className="button button-outline game-detection-back" onClick={onContinue}><ChevronLeft size={14} /> BACK TO DASHBOARD</button>
+      {isCs2 && <button className="button button-outline game-optimize-trigger" onClick={onOptimize}><Zap size={14} /> OPTIMIZE FOR CS2</button>}
       <div className="game-entry-copy">
         <span className="recommended-badge detection-recommended-badge"><Sparkles size={11} /> RECOMMENDED FIRST STEP</span>
-        <span className="eyebrow"><i /> GAME DETECTION / 001</span>
-        <h1>YOUR NEXT<br /><span>ROUND STARTS HERE.</span></h1>
-        <p>Find your local Counter-Strike 2 installation. A scan reads local game and system data and sends diagnostic pings to reachable public resolver endpoints.</p>
+        <span className="eyebrow"><i /> GAME DETECTION / {String(gameProfiles.findIndex((profile) => profile.id === game.id) + 1).padStart(3, '0')}</span>
+        <h1>{isCs2 ? <>YOUR NEXT<br /><span>ROUND STARTS HERE.</span></> : <>FIND YOUR<br /><span>{game.name}.</span></>}</h1>
+        <p>{isCs2 ? 'Find your local Counter-Strike 2 installation. A scan reads local game and system data and sends diagnostic pings to reachable public resolver endpoints.' : `Find your local ${game.name} installation. CSRIFT verifies supported local game paths without modifying game files.`}</p>
         <div className="game-entry-assurance"><span><ShieldCheck size={14} /> LOCAL FILE CHECK</span><span><Activity size={14} /> NO GAME MODIFICATION</span></div>
       </div>
-      <motion.section className={`game-detection-card ${detected ? 'is-detected' : ''}`} initial={{ opacity: 0, y: reduceMotion ? 0 : 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: reduceMotion ? 0 : .12, duration: .5 }}>
-        <div className={`game-poster ${posterUnavailable ? 'poster-fallback' : ''}`}>
-          {!posterUnavailable ? <img src="/assets/cs2-cover.png" alt="Counter-Strike 2 cover art" onError={() => setPosterUnavailable(true)} /> : <div className="poster-fallback-art"><span>730</span><b>CS2</b><i>COUNTER-STRIKE<br />GAME DETECTION</i><small>GAME ARTWORK NOT INCLUDED</small></div>}
-          <span className="poster-index">CSRIFT / 730</span>
+      <motion.section className={`game-detection-card ${detected ? 'is-detected' : ''}`} style={{ '--game-accent': game.accent } as CSSProperties} initial={{ opacity: 0, y: reduceMotion ? 0 : 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: reduceMotion ? 0 : .12, duration: .5 }}>
+        <div className="game-detection-game-picker" role="tablist" aria-label="Select a game to detect">{gameProfiles.map((profile) => <button key={profile.id} role="tab" aria-selected={profile.id === game.id} className={profile.id === game.id ? 'is-selected' : ''} style={{ '--detection-accent': profile.accent } as CSSProperties} onClick={() => { setPosterUnavailable(false); onSelectGame(profile.id) }}>{profile.name}</button>)}</div>
+        <div className={`game-poster ${isCs2 ? '' : 'game-poster-wide'} ${posterUnavailable ? 'poster-fallback' : ''}`}>
+          {!posterUnavailable
+            ? <img src={isCs2 ? '/assets/cs2-cover.png' : game.banner} alt={`${game.name} game artwork`} onError={() => setPosterUnavailable(true)} />
+            : <div className="poster-fallback-art"><span>{isCs2 ? '730' : game.platform.split(' · ')[0]}</span><b>{isCs2 ? 'CS2' : game.name}</b><i>{game.subtitle}</i><small>GAME ARTWORK NOT INCLUDED</small></div>}
+          <span className="poster-index">CSRIFT / {isCs2 ? '730' : game.id.toUpperCase()}</span>
         </div>
-        <div className="game-card-meta"><span className={`game-state-tag ${steamProfile ? 'detected' : ''}`}><i />{steamProfile ? 'STEAM CONNECTED' : 'STEAM / GAME LIBRARY'}</span><span className="eyebrow"><i /> STEAM APP ID / 730</span></div>
-        <h2>COUNTER-STRIKE 2</h2>
-        <p className="game-detection-label">{steamProfile ? `CONNECTED AS ${steamProfile.personaName.toUpperCase()}` : 'CONNECT YOUR STEAM ACCOUNT'}</p>
-        {detected && detection.installPath && <div className="detected-path"><span>VERIFIED INSTALLATION</span><code title={detection.installPath}>{detection.installPath}</code><small>{detection.configFiles.length} CS2 settings file{detection.configFiles.length === 1 ? '' : 's'} · {detection.libraryPaths.length} Steam librar{detection.libraryPaths.length === 1 ? 'y' : 'ies'} checked</small></div>}
-        {busy && <div className="game-search-progress"><div className="game-search-label"><LoaderCircle size={13} className="spin" /><span>{progress?.step ?? 'SEARCHING FOR STEAM'}</span><b>{progress?.percent ?? 0}%</b></div><div className="progress-track"><div className="progress-fill" style={{ width: `${progress?.percent ?? 0}%` }} /></div></div>}
-        {error && <p className="game-detection-error"><CircleAlert size={14} />{error}</p>}
+        <div className="game-card-meta"><span className={`game-state-tag ${steamProfile && isCs2 ? 'detected' : ''}`}><i />{steamProfile && isCs2 ? 'STEAM CONNECTED' : game.platform}</span><span className="eyebrow"><i />{isCs2 ? 'STEAM APP ID / 730' : game.id === 'pubg' ? 'STEAM APP ID / 578080' : 'LOCAL GAME DETECTION'}</span></div>
+        <h2>{title}</h2>
+        <p className="game-detection-label">{detected ? 'GAME FOUND · VERIFIED LOCAL EXECUTABLE' : isCs2 && steamProfile ? `CONNECTED AS ${steamProfile.personaName.toUpperCase()}` : 'GAME NOT DETECTED ON THIS PC'}</p>
+        {detected && (isCs2 ? detection?.installPath : installation?.installPath) && <div className="detected-path"><span>VERIFIED INSTALLATION</span><code title={isCs2 ? detection?.installPath ?? '' : installation?.installPath}>{isCs2 ? detection?.installPath : installation?.installPath}</code>{isCs2 && detection && <small>{detection.configFiles.length} CS2 settings file{detection.configFiles.length === 1 ? '' : 's'} · {detection.libraryPaths.length} Steam librar{detection.libraryPaths.length === 1 ? 'y' : 'ies'} checked</small>}</div>}
+        {scanBusy && <div className="game-search-progress"><div className="game-search-label"><LoaderCircle size={13} className="spin" /><span>{isCs2 ? progress?.step ?? 'SEARCHING FOR STEAM' : 'CHECKING GAME INSTALLATIONS'}</span><b>{isCs2 ? progress?.percent ?? 0 : '…'}</b></div><div className="progress-track"><div className="progress-fill" style={{ width: `${isCs2 ? progress?.percent ?? 0 : 65}%` }} /></div></div>}
+        {scanError && <p className="game-detection-error"><CircleAlert size={14} />{scanError}</p>}
         <div className="game-entry-actions">
-          {steamProfile
-            ? <button className="button button-primary game-primary-action" onClick={onOpenLibrary}><Library size={15} /> OPEN GAME LIBRARY <ArrowRight size={15} /></button>
-            : <button className="button button-primary game-primary-action steam-connect-button" onClick={onConnectSteam} disabled={steamBusy}><Gamepad2 size={16} /> CONNECT YOUR STEAM ACCOUNT <ArrowRight size={15} /></button>}
-          <p className="steam-connect-explainer">Connect your Steam account to discover your game library and manage your games with CSRIFT.</p>
-          {steamProfile && <button className="button button-outline game-manual-action" onClick={onDisconnectSteam}><LogOut size={14} /> DISCONNECT STEAM ACCOUNT</button>}
-          {detected && <button className="button button-outline game-manual-action" onClick={onScan}><EyeMark /> SCAN CS2 SYSTEM</button>}
-          <button className="button button-outline game-manual-action" onClick={() => void onFind()} disabled={busy}><Search size={14} /> {busy ? 'SEARCHING…' : detected ? 'REFRESH LOCAL CS2 DETECTION' : 'FIND CS2 ON THIS PC'}</button>
-          {!detected && <button className="button button-outline game-manual-action" onClick={() => void onPick()} disabled={busy}><ExternalLink size={14} /> SELECT INSTALLATION FOLDER</button>}
+          {isCs2 ? <>
+            {steamProfile
+              ? <button className="button button-primary game-primary-action" onClick={onOpenLibrary}><Library size={15} /> OPEN GAME LIBRARY <ArrowRight size={15} /></button>
+              : <button className="button button-primary game-primary-action steam-connect-button" onClick={onConnectSteam} disabled={steamBusy}><SteamMark /> CONNECT YOUR STEAM ACCOUNT <ArrowRight size={15} /></button>}
+            <p className="steam-connect-explainer">Connect your Steam account to discover your game library and manage your games with CSRIFT.</p>
+            {steamProfile && <button className="button button-outline game-manual-action" onClick={onDisconnectSteam}><LogOut size={14} /> LOG OUT OF CSRIFT</button>}
+            {detected && <button className="button button-outline game-manual-action" onClick={onScan}><EyeMark /> SCAN CS2 SYSTEM</button>}
+            <button className="button button-outline game-manual-action" onClick={() => void onFind()} disabled={scanBusy}><Search size={14} /> {scanBusy ? 'SEARCHING…' : detected ? 'REFRESH LOCAL CS2 DETECTION' : 'FIND CS2 ON THIS PC'}</button>
+            {!detected && <button className="button button-outline game-manual-action" onClick={() => void onPick()} disabled={scanBusy}><ExternalLink size={14} /> SELECT INSTALLATION FOLDER</button>}
+          </> : <>
+            {detected && installation && <button className="button button-primary game-primary-action" onClick={() => onLaunchGame(installation)}><Gamepad2 size={15} /> LAUNCH {game.name} <ArrowRight size={15} /></button>}
+            <button className={`button ${detected ? 'button-outline' : 'button-primary game-primary-action'} game-manual-action`} onClick={onScanManagedGame} disabled={scanBusy}><Search size={14} /> {scanBusy ? 'SEARCHING…' : detected ? `REFRESH ${game.name} DETECTION` : `FIND ${game.name} ON THIS PC`}</button>
+            <button className="button button-outline game-manual-action" onClick={() => onPickManagedGame(game.id)} disabled={scanBusy}><ExternalLink size={14} /> SELECT GAME EXECUTABLE</button>
+          </>}
         </div>
-        {detection && !detected && !busy && <button className="game-continue-link" onClick={onContinue}>CONTINUE WITHOUT CS2 <ArrowRight size={13} /></button>}
+        {isCs2 && detection && !detected && !busy && <button className="game-continue-link" onClick={onContinue}>CONTINUE WITHOUT CS2 <ArrowRight size={13} /></button>}
       </motion.section>
       <div className="game-entry-footer"><span>CSRIFT / LOCAL GAME CHECK</span><span>NO MEMORY ACCESS · NO INJECTION · NO ANTICHEAT INTERFERENCE</span></div>
     </motion.main>
@@ -691,7 +887,7 @@ function SteamConnectionOverlay({ stage, error, reduceMotion, onCancel, onRetry,
         <div className={`steam-auth-connection ${connected ? 'is-connected' : ''}`}>
           <div className="steam-auth-node"><span className="steam-auth-brand">C</span><small>CSRIFT</small></div>
           <div className="steam-auth-link"><i /></div>
-          <div className="steam-auth-node steam-auth-node-steam"><span><Gamepad2 size={26} /></span><small>STEAM</small></div>
+          <div className="steam-auth-node steam-auth-node-steam"><span><SteamMark /></span><small>STEAM</small></div>
         </div>
         <div className={`steam-auth-status ${connected ? 'is-connected' : stage === 'error' ? 'is-error' : ''}`}>
           {stage !== 'error' && <LoaderCircle size={13} className={connected ? '' : 'spin'} />}
@@ -771,7 +967,7 @@ function Cs2OptimizationPanel({ status, loading, busy, error, onClose, onApply, 
       <motion.section className="optimization-panel" role="dialog" aria-modal="true" aria-labelledby="optimization-title" initial={{ opacity: 0, y: 12, scale: .985 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 8, scale: .99 }}>
         <div className="optimization-panel-heading"><span className="modal-icon"><Zap size={19} /></span><button className="icon-action" aria-label="Close CS2 optimization panel" onClick={onClose}><X size={15} /></button></div>
         <span className="eyebrow"><i /> USER-CONTROLLED / REVERSIBLE</span>
-        <h2 id="optimization-title">CS2 session profile.</h2>
+        <h2 id="optimization-title">Windows performance profile.</h2>
         <p className="optimization-intro">Choose each Windows setting separately. CSRIFT saves its current value before changing it, and does not promise a specific FPS or latency improvement.</p>
         {loading && <div className="optimization-loading"><LoaderCircle size={14} className="spin" /> READING CURRENT WINDOWS SETTINGS</div>}
         {error && <p className="optimization-error"><CircleAlert size={14} />{error}</p>}
@@ -817,7 +1013,14 @@ function readPingHistory(): PingResult[] {
 
 function DesktopApp() {
   const [page, setPage] = useState<PageId>('dashboard')
-  const [entryScreen, setEntryScreen] = useState(true)
+  const [onboarding, setOnboarding] = useState<OnboardingProgress>(readOnboarding)
+  const [onboardingStorageError, setOnboardingStorageError] = useState(false)
+  const [legalDocument, setLegalDocument] = useState<'privacy' | 'terms' | null>(null)
+  const [entryScreen, setEntryScreen] = useState(false)
+  const [selectedGameId, setSelectedGameId] = useState<GameId>(readSelectedGame)
+  const [manualGamePaths, setManualGamePaths] = useState<Partial<Record<GameId, string>>>(readManualGamePaths)
+  const [managedGameInstallations, setManagedGameInstallations] = useState<GameInstallation[]>([])
+  const [managedGamesBusy, setManagedGamesBusy] = useState(false)
   const [gameDetection, setGameDetection] = useState<GameDetection | null>(null)
   const [detectionBusy, setDetectionBusy] = useState(false)
   const [detectionProgress, setDetectionProgress] = useState<ScanProgress | null>(null)
@@ -867,6 +1070,35 @@ function DesktopApp() {
   const prefersReducedMotion = useReducedMotion()
   const motionDisabled = Boolean(settings.reduceMotion || prefersReducedMotion)
   const currentPage = pageCopy[page]
+  const language = onboarding.language ?? 'en'
+
+  const persistOnboarding = useCallback((next: OnboardingProgress) => {
+    try {
+      localStorage.setItem(ONBOARDING_STORAGE_KEY, JSON.stringify(next))
+      setOnboarding(next)
+      setOnboardingStorageError(false)
+      return true
+    } catch {
+      setOnboardingStorageError(true)
+      return false
+    }
+  }, [])
+
+  const chooseOnboardingLanguage = (nextLanguage: AppLanguage) => {
+    persistOnboarding({ ...onboarding, language: nextLanguage, step: onboarding.completed ? 'complete' : 'legal', consent: onboarding.completed ? onboarding.consent : null })
+  }
+
+  const acceptOnboardingLegal = (consent: LegalConsent) => {
+    persistOnboarding({ ...onboarding, consent, step: 'steam' })
+  }
+
+  const changeLanguage = (nextLanguage: AppLanguage) => {
+    persistOnboarding({ ...onboarding, language: nextLanguage })
+  }
+
+  const finishOnboarding = useCallback(() => {
+    persistOnboarding({ ...onboarding, step: 'complete', completed: true })
+  }, [onboarding, persistOnboarding])
 
   const recordActivity = useCallback((title: string, detail: string, tone: ActivityItem['tone'] = 'success') => {
     setActivity((items) => [{ id: Date.now() + Math.random(), title, detail, time: Date.now(), tone }, ...items].slice(0, 20))
@@ -955,6 +1187,17 @@ function DesktopApp() {
     }
   }, [notify])
 
+  const refreshManagedGameInstallations = useCallback(async (paths: Partial<Record<GameId, string>> = readManualGamePaths()) => {
+    try {
+      const installations = await invoke<GameInstallation[]>('detect_managed_game_installations', { manualPaths: paths })
+      setManagedGameInstallations(installations)
+      return installations
+    } catch (error) {
+      notify('Game installation scan failed', String(error), 'error')
+      return null
+    }
+  }, [notify])
+
   const refreshSteamLibrary = useCallback(async (session: SteamSession | null = steamSession) => {
     if (!session) return
     setSteamLibraryLoading(true)
@@ -984,6 +1227,7 @@ function DesktopApp() {
   }, [notify, refreshLocalSteamGames, steamSession])
 
   const startSteamConnection = useCallback(async () => {
+    const connectingDuringOnboarding = !onboarding.completed && onboarding.step === 'steam'
     const controller = new AbortController()
     steamAuthAbortRef.current = controller
     steamAuthFlowRef.current = null
@@ -1025,11 +1269,19 @@ function DesktopApp() {
           return
         }
         setSteamSession(session)
-        setSteamAuthStage('verified')
         setSteamAuthError(null)
-        setPage('library')
-        setEntryScreen(false)
-        notify('Steam account connected', `Signed in as ${session.profile.personaName}.`, 'success')
+        if (connectingDuringOnboarding) {
+          setSteamAuthStage('verified')
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 1100))
+          if (controller.signal.aborted) return
+          setSteamAuthStage(null)
+          persistOnboarding({ ...onboarding, step: 'intro' })
+        } else {
+          setSteamAuthStage('verified')
+          setPage('library')
+          setEntryScreen(false)
+          notify('Steam account connected', `Signed in as ${session.profile.personaName}.`, 'success')
+        }
         void refreshSteamLibrary(session)
         return
       }
@@ -1047,7 +1299,7 @@ function DesktopApp() {
       if (steamAuthAbortRef.current === controller) steamAuthAbortRef.current = null
       steamAuthFlowRef.current = null
     }
-  }, [notify, refreshSteamLibrary])
+  }, [notify, onboarding, persistOnboarding, refreshSteamLibrary])
 
   const cancelSteamConnection = useCallback(() => {
     const flow = steamAuthFlowRef.current
@@ -1073,9 +1325,9 @@ function DesktopApp() {
   const requestSteamDisconnect = useCallback(() => {
     if (!steamSession) return
     setConfirmAction({
-      title: 'Disconnect this Steam account?',
-      detail: 'CSRIFT will revoke its server session and clear the account and library data from this app session. Your Steam account and games are not changed.',
-      confirmLabel: 'REVOKE & DISCONNECT',
+      title: 'Log out of CSRIFT?',
+      detail: 'CSRIFT will revoke its server session and clear the connected account and library data from this app session. This does not sign you out of Steam Community or change your Steam account.',
+      confirmLabel: 'LOG OUT OF CSRIFT',
       run: async () => {
         try {
           await steamApiRequest('/v1/auth/logout', steamSession.accessToken, { method: 'POST' })
@@ -1085,7 +1337,7 @@ function DesktopApp() {
           setSteamLibraryError(null)
           setSteamInstallCheckComplete(false)
           setSteamInstallError(null)
-          notify('Steam disconnected', 'The CSRIFT session was revoked. Your Steam account was not changed.', 'success')
+          notify('Logged out of CSRIFT', 'The CSRIFT session was revoked. Your Steam account was not changed.', 'success')
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
           if (message === steamErrors.SESSION_EXPIRED) {
@@ -1113,15 +1365,25 @@ function DesktopApp() {
   }, [pingHistory])
 
   useEffect(() => {
+    document.documentElement.lang = language
     document.documentElement.dataset.accent = settings.accent
     document.documentElement.dataset.reduceMotion = String(motionDisabled)
-  }, [settings.accent, motionDisabled])
+  }, [language, settings.accent, motionDisabled])
 
   useEffect(() => {
+    try { localStorage.setItem('csrift-desktop-selected-game-v1', selectedGameId) } catch { /* Selection remains available for this session. */ }
+  }, [selectedGameId])
+
+  useEffect(() => {
+    if (selectedGameId !== 'cs2' && page === 'config') setPage('dashboard')
+  }, [page, selectedGameId])
+
+  useEffect(() => {
+    if (!onboarding.completed) return
     const delay = page === 'monitor' && monitoring ? 2200 : 12000
     const timer = window.setInterval(() => { void refreshSnapshot(true) }, delay)
     return () => window.clearInterval(timer)
-  }, [monitoring, page, refreshSnapshot])
+  }, [monitoring, onboarding.completed, page, refreshSnapshot])
 
   const groups = useMemo(() => [...new Set(navigation.map((item) => item.group))], [])
 
@@ -1151,6 +1413,58 @@ function DesktopApp() {
       setDetectionBusy(false)
     }
   }, [notify])
+
+  const scanSelectedGame = async () => {
+    setManagedGamesBusy(true)
+    try {
+      const installations = await refreshManagedGameInstallations(manualGamePaths)
+      if (!installations) return
+      if (selectedGameId === 'cs2') {
+        await detectGame()
+        if (installations.some((installation) => installation.gameId === 'cs2')) {
+          notify('Counter-Strike 2 verified', 'Steam manifest and executable are present on this PC.', 'success')
+        }
+      } else {
+        const installation = installations.find((item) => item.gameId === selectedGameId)
+        const name = gameProfiles.find((game) => game.id === selectedGameId)?.name ?? selectedGameId
+        notify(
+          installation ? `${name} detected` : `${name} not found`,
+          installation ? `Verified game executable in ${installation.installPath}` : 'No verified install was found. You can select the game executable manually.',
+          installation ? 'success' : 'info',
+        )
+      }
+    } finally {
+      setManagedGamesBusy(false)
+    }
+  }
+
+  const pickManagedGame = async (gameId: GameId) => {
+    try {
+      const executablePath = await invoke<string | null>('pick_managed_game_executable', { gameId })
+      if (!executablePath) return
+      const nextPaths = { ...manualGamePaths, [gameId]: executablePath }
+      setManualGamePaths(nextPaths)
+      localStorage.setItem(MANUAL_GAME_PATHS_KEY, JSON.stringify(nextPaths))
+      const installations = await refreshManagedGameInstallations(nextPaths)
+      if (installations?.some((installation) => installation.gameId === gameId)) {
+        const game = gameProfiles.find((profile) => profile.id === gameId)
+        notify(`${game?.name ?? gameId} path saved`, 'The selected executable was verified and is available for launch.', 'success')
+      }
+    } catch (error) {
+      notify('Game executable could not be selected', String(error), 'error')
+    }
+  }
+
+  const launchManagedGame = async (installation: GameInstallation) => {
+    try {
+      await invoke('launch_managed_game', { gameId: installation.gameId, executablePath: installation.executablePath })
+      const game = gameProfiles.find((profile) => profile.id === installation.gameId)
+      notify(`${game?.name ?? installation.gameId} launch requested`, 'CSRIFT started the verified game executable or its official launcher.', 'success')
+      window.setTimeout(() => { void refreshSnapshot(true) }, 1000)
+    } catch (error) {
+      notify('Game could not be launched', String(error), 'error')
+    }
+  }
 
   const pickGameFolder = async () => {
     try {
@@ -1256,12 +1570,16 @@ function DesktopApp() {
       setSettings(savedSettings)
       setDataPath(savedDataPath)
       setIntroEnabledOnBoot(savedSettings.introEnabled)
+      if (!onboarding.completed) {
+        setBooting(false)
+        return
+      }
       if (savedSettings.introEnabled) {
         introTimer = window.setTimeout(() => { if (active) setBooting(false) }, savedSettings.reduceMotion ? 350 : 1250)
       } else {
         setBooting(false)
       }
-      await Promise.all([refreshSnapshot(true), refreshConfig(), refreshStartup(), refreshTempScan(true), refreshPowerPlan(), refreshLocalSteamGames()])
+      await Promise.all([refreshSnapshot(true), refreshConfig(), refreshStartup(), refreshTempScan(true), refreshPowerPlan(), refreshLocalSteamGames(), refreshManagedGameInstallations()])
       if (active) await detectGame()
     })().catch((error: unknown) => {
       if (active) {
@@ -1273,7 +1591,7 @@ function DesktopApp() {
       active = false
       if (introTimer != null) window.clearTimeout(introTimer)
     }
-  }, [detectGame, notify, refreshConfig, refreshLocalSteamGames, refreshPowerPlan, refreshSnapshot, refreshStartup, refreshTempScan])
+  }, [detectGame, notify, onboarding.completed, refreshConfig, refreshLocalSteamGames, refreshManagedGameInstallations, refreshPowerPlan, refreshSnapshot, refreshStartup, refreshTempScan])
 
   const runPing = async (target: string) => {
     const result = await invoke<PingResult>('run_ping_test', { target })
@@ -1420,7 +1738,7 @@ function DesktopApp() {
 
   const renderPage = () => {
     switch (page) {
-      case 'dashboard': return <DashboardPage snapshot={snapshot} history={telemetryHistory} latestPing={latestPing} config={configStatus} gameDetection={gameDetection} steamSession={steamSession} steamLibrary={steamLibrary} steamLibraryLoading={steamLibraryLoading} onPage={setPage} onGameDetection={() => setEntryScreen(true)} onConnectSteam={() => { void startSteamConnection() }} onOpenLibrary={openSteamLibrary} onDisconnectSteam={requestSteamDisconnect} />
+      case 'dashboard': return <DashboardPage snapshot={snapshot} history={telemetryHistory} latestPing={latestPing} config={configStatus} gameDetection={gameDetection} steamSession={steamSession} steamLibrary={steamLibrary} steamLibraryLoading={steamLibraryLoading} installations={managedGameInstallations} selectedGameId={selectedGameId} reduceMotion={motionDisabled} scanning={managedGamesBusy} onSelectGame={setSelectedGameId} onScanGames={() => { void scanSelectedGame() }} onPickGame={(gameId) => { void pickManagedGame(gameId) }} onLaunchGame={(installation) => { void launchManagedGame(installation) }} onPage={setPage} onGameDetection={() => setEntryScreen(true)} onConnectSteam={() => { void startSteamConnection() }} onOpenLibrary={openSteamLibrary} onDisconnectSteam={requestSteamDisconnect} />
       case 'library': return <SteamLibraryPage session={steamSession} library={steamLibrary} installedGames={steamInstalledGames} installCheckComplete={steamInstallCheckComplete} installError={steamInstallError} localLoading={steamLocalGamesLoading} localError={steamLocalGamesError} loading={steamLibraryLoading} error={steamLibraryError} onConnect={() => { void startSteamConnection() }} onSync={() => { void refreshSteamLibrary() }} onDisconnect={requestSteamDisconnect} onRefreshLocal={() => { void refreshLocalSteamGames() }} />
       case 'fps': return <FpsPage snapshot={snapshot} history={telemetryHistory} onRefresh={() => void refreshSnapshot()} loading={loadingSnapshot} />
       case 'network': return <NetworkPage latestPing={latestPing} pingHistory={pingHistory} onPing={runPing} />
@@ -1428,7 +1746,7 @@ function DesktopApp() {
       case 'config': return <ConfigPage status={configStatus} backups={backups} profiles={profiles} busy={busyAction} onBackup={createBackup} onOpenFolder={openFolder} onRefresh={() => void refreshConfig()} onRestore={restoreBackup} onCreateProfile={createProfile} onRenameProfile={renameProfile} onDeleteProfile={deleteProfile} />
       case 'optimize': return <OptimizePage startup={startupEntries} scan={tempScan} powerPlan={activePowerPlan} busy={busyAction} onRefresh={() => { void refreshStartup(); void refreshTempScan(); void refreshPowerPlan() }} onScan={scanTemporary} onCleanup={cleanTemporary} />
       case 'recovery': return <RecoveryPage backups={backups} profiles={profiles} activity={activity} onRefresh={() => { void refreshConfig() }} onRestore={restoreBackup} onOpenData={openDataFolder} />
-      case 'settings': return <SettingsPage settings={settings} dataPath={dataPath} saveSettings={saveSettings} notify={notify} />
+      case 'settings': return <SettingsPage settings={settings} dataPath={dataPath} saveSettings={saveSettings} notify={notify} language={language} onLanguageChange={changeLanguage} onOpenLegal={setLegalDocument} />
     }
   }
 
@@ -1436,16 +1754,16 @@ function DesktopApp() {
     <div className={`desktop-shell ${settings.accent === 'amber' ? 'accent-amber' : ''}`}>
       <div className="titlebar" data-tauri-drag-region>
         <div className="titlebar-brand" data-tauri-drag-region><span>C</span><b>CSRIFT</b><i /></div>
-        <div className="titlebar-center" data-tauri-drag-region><span>{entryScreen ? 'GAME DETECTION' : 'CONTROL CENTER'}</span><ChevronRight size={12} />{entryScreen ? 'COUNTER-STRIKE 2' : currentPage.title}</div>
+        <div className="titlebar-center" data-tauri-drag-region><span>{entryScreen ? 'GAME DETECTION' : 'CONTROL CENTER'}</span><ChevronRight size={12} />{entryScreen ? gameProfiles.find((game) => game.id === selectedGameId)?.name ?? 'COUNTER-STRIKE 2' : currentPage.title}</div>
         <div className="titlebar-right"><span className="local-only-label"><i /> LOCAL SESSION</span><WindowControls /></div>
       </div>
 
-      {entryScreen ? <GameDetectionScreen detection={gameDetection} busy={detectionBusy} progress={detectionProgress} error={detectionError} steamProfile={steamSession?.profile ?? null} steamBusy={steamAuthStage !== null} onConnectSteam={() => { void startSteamConnection() }} onDisconnectSteam={requestSteamDisconnect} onOpenLibrary={openSteamLibrary} onFind={detectGame} onPick={pickGameFolder} onContinue={() => setEntryScreen(false)} onScan={() => { void startHawkEyeScan() }} onOptimize={openOptimization} reduceMotion={motionDisabled} /> : <div className="app-layout">
+      {entryScreen ? <GameDetectionScreen detection={gameDetection} busy={detectionBusy} progress={detectionProgress} error={detectionError} steamProfile={steamSession?.profile ?? null} installations={managedGameInstallations} selectedGameId={selectedGameId} steamBusy={steamAuthStage !== null} managedBusy={managedGamesBusy} onSelectGame={setSelectedGameId} onConnectSteam={() => { void startSteamConnection() }} onDisconnectSteam={requestSteamDisconnect} onOpenLibrary={openSteamLibrary} onFind={detectGame} onPick={pickGameFolder} onContinue={() => setEntryScreen(false)} onScan={() => { void startHawkEyeScan() }} onScanManagedGame={() => { void scanSelectedGame() }} onPickManagedGame={(gameId) => { void pickManagedGame(gameId) }} onLaunchGame={(installation) => { void launchManagedGame(installation) }} onOptimize={openOptimization} reduceMotion={motionDisabled} /> : <div className="app-layout">
         <aside className="sidebar">
           <div className="sidebar-brand"><span className="brand-symbol">C</span><span><b>CSRIFT</b><small>PRECISION / CONTROL</small></span><span className="brand-presence"><i /></span></div>
           <div className="sidebar-rule" />
           <button className={`nav-item game-detection-nav ${entryScreen ? 'is-current' : ''}`} onClick={() => setEntryScreen(true)} aria-current={entryScreen ? 'page' : undefined}><Gamepad2 size={16} strokeWidth={1.7} /><span>Game Detection</span><small className="nav-recommended">RECOMMENDED</small>{entryScreen && <i className="nav-active-mark" />}</button>
-          <nav className="sidebar-nav" aria-label="Application pages">{groups.map((group) => <div className="nav-group" key={group}><span className="nav-group-label">{group}</span>{navigation.filter((item) => item.group === group).map((item) => { const Icon = item.icon; return <button className={`nav-item ${page === item.id ? 'is-current' : ''}`} key={item.id} onClick={() => setPage(item.id)} aria-current={page === item.id ? 'page' : undefined}><Icon size={16} strokeWidth={1.7} /><span>{item.label}</span>{page === item.id && <i className="nav-active-mark" />}</button> })}</div>)}</nav>
+          <nav className="sidebar-nav" aria-label="Application pages">{groups.map((group) => <div className="nav-group" key={group}><span className="nav-group-label">{group}</span>{navigation.filter((item) => item.group === group && (item.id !== 'config' || selectedGameId === 'cs2')).map((item) => { const Icon = item.icon; return <button className={`nav-item ${page === item.id ? 'is-current' : ''}`} key={item.id} onClick={() => setPage(item.id)} aria-current={page === item.id ? 'page' : undefined}><Icon size={16} strokeWidth={1.7} /><span>{item.label}</span>{page === item.id && <i className="nav-active-mark" />}</button> })}</div>)}</nav>
           <div className="sidebar-bottom">
             <div className="sidebar-system"><span className="sidebar-section-label">SYSTEM STATUS</span><div className="sidebar-health"><i className={snapshot ? 'healthy' : 'pending'} /><span>{snapshot ? 'WINDOWS CONNECTED' : 'READING SYSTEM'}</span></div><div className="sidebar-mini-metrics"><span><Cpu size={12} /> CPU <b>{percent(snapshot?.cpuUsagePercent)}</b></span><span><Activity size={12} /> RAM <b>{percent(snapshot?.memoryUsagePercent)}</b></span></div></div>
             <button className="sidebar-settings" onClick={() => setPage('settings')}><span className="side-avatar">C</span><span><b>CSRIFT DESKTOP</b><small>PREVIEW BUILD 0.1.0</small></span><ChevronDown size={13} /></button>
@@ -1455,7 +1773,7 @@ function DesktopApp() {
         <main className="main-panel">
           <header className="content-header">
             <div className="content-heading"><span className="eyebrow"><i />{currentPage.eyebrow}</span><h1>{currentPage.title}</h1><p>{currentPage.description}</p></div>
-            <div className="content-tools"><button className="button button-primary optimize-header-button" onClick={openOptimization}><Zap size={13} /> OPTIMIZE FOR CS2</button><button className="tool-button" title="Refresh system data" onClick={() => void refreshSnapshot()} disabled={loadingSnapshot}><RefreshCw size={15} className={loadingSnapshot ? 'spin' : ''} /></button><span className="header-separator" /><button className="session-button" onClick={() => setPage('recovery')}><span className="session-icon"><ShieldCheck size={13} /></span><span><b>LOCAL & SAFE</b><small>{snapshot ? snapshot.osName ?? 'WINDOWS DESKTOP' : 'AWAITING SYSTEM'}</small></span></button></div>
+            <div className="content-tools"><button className="button button-primary optimize-header-button" onClick={openOptimization}><Zap size={13} /> WINDOWS PERFORMANCE</button><button className="tool-button" title="Refresh system data" onClick={() => void refreshSnapshot()} disabled={loadingSnapshot}><RefreshCw size={15} className={loadingSnapshot ? 'spin' : ''} /></button><span className="header-separator" /><button className="session-button" onClick={() => setPage('recovery')}><span className="session-icon"><ShieldCheck size={13} /></span><span><b>LOCAL & SAFE</b><small>{snapshot ? snapshot.osName ?? 'WINDOWS DESKTOP' : 'AWAITING SYSTEM'}</small></span></button></div>
           </header>
 
           <div className="content-scroll">
@@ -1474,6 +1792,8 @@ function DesktopApp() {
       <AnimatePresence>{hawkEyeVisible && <HawkEyeOverlay progress={hawkEyeProgress} report={hawkEyeReport} error={hawkEyeError} reduceMotion={motionDisabled} gameDetected={gameDetection?.detected === true} onCancel={() => { void cancelHawkEyeScan() }} onContinue={() => { setHawkEyeVisible(false); setEntryScreen(false) }} onLaunch={() => { void launchGame() }} onRetry={() => { void startHawkEyeScan() }} onOptimize={openOptimization} />}</AnimatePresence>
 
       <AnimatePresence>{optimizationOpen && <Cs2OptimizationPanel status={optimizationStatus} loading={optimizationLoading} busy={optimizationBusy} error={optimizationError} onClose={() => setOptimizationOpen(false)} onApply={(setting) => confirmOptimizationChange(setting)} onRestore={(setting) => confirmOptimizationChange(setting, true)} />}</AnimatePresence>
+      {!onboarding.completed && <Suspense fallback={<div className="onboarding-loading" />}><AnimatePresence><OnboardingFlow key={language} progress={onboarding} language={language} steamConnected={steamSession !== null} steamStage={steamAuthStage} steamError={steamAuthError} reduceMotion={motionDisabled} storageError={onboardingStorageError} onChooseLanguage={chooseOnboardingLanguage} onAcceptLegal={acceptOnboardingLegal} onConnectSteam={() => { void startSteamConnection() }} onSkipSteam={() => { if (steamAuthStage && steamAuthStage !== 'verified') cancelSteamConnection(); persistOnboarding({ ...onboarding, step: 'intro' }) }} onFinish={finishOnboarding} onBackToLanguage={() => persistOnboarding({ ...onboarding, step: 'language' })} /></AnimatePresence></Suspense>}
+      <AnimatePresence>{legalDocument && <Suspense fallback={<div className="onboarding-loading" />}><LegalDocumentsDialog language={language} initialTab={legalDocument} onClose={() => setLegalDocument(null)} /></Suspense>}</AnimatePresence>
 
       <AnimatePresence>{toasts.map((toast) => <motion.div key={toast.id} className={`toast toast-${toast.tone}`} initial={{ opacity: 0, y: 12, x: 8 }} animate={{ opacity: 1, y: 0, x: 0 }} exit={{ opacity: 0, y: 7, x: 8 }}><span className="toast-icon">{toast.tone === 'success' ? <CheckCircle2 size={16} /> : toast.tone === 'error' ? <CircleAlert size={16} /> : <Activity size={16} />}</span><span><b>{toast.title}</b><small>{toast.message}</small></span><button aria-label="Dismiss notification" onClick={() => dismiss(toast.id)}><X size={13} /></button></motion.div>)}</AnimatePresence>
 

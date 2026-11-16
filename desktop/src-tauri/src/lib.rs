@@ -62,6 +62,7 @@ struct SystemSnapshot {
     gpu_temperature_c: Option<f32>,
     vram_total_bytes: Option<u64>,
     cs2_running: bool,
+    running_game_ids: Vec<String>,
     active_process_count: usize,
     processes: Vec<ProcessUsage>,
     disks: Vec<DiskUsage>,
@@ -142,6 +143,38 @@ async fn get_system_snapshot() -> Result<SystemSnapshot, String> {
                 .to_string_lossy()
                 .eq_ignore_ascii_case("cs2.exe")
         });
+        let process_names = system
+            .processes()
+            .values()
+            .map(|process| process.name().to_string_lossy().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let running_game_ids = [
+            ("cs2", &["cs2.exe"][..]),
+            ("pubg", &["tslgame.exe", "tslgame_be.exe"][..]),
+            (
+                "valorant",
+                &["valorant-win64-shipping.exe", "valorant.exe"][..],
+            ),
+            (
+                "fc-online",
+                &[
+                    "fconline.exe",
+                    "fc online.exe",
+                    "fifaonline4.exe",
+                    "fifa online 4.exe",
+                    "fifa4zf.exe",
+                    "fconline_x64.exe",
+                ][..],
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(game_id, names)| {
+            process_names
+                .iter()
+                .any(|process| names.contains(&process.as_str()))
+                .then(|| game_id.to_string())
+        })
+        .collect();
 
         Ok(SystemSnapshot {
             os_name: System::long_os_version(),
@@ -159,6 +192,7 @@ async fn get_system_snapshot() -> Result<SystemSnapshot, String> {
             gpu_temperature_c,
             vram_total_bytes: None,
             cs2_running,
+            running_game_ids,
             active_process_count: system.processes().len(),
             processes,
             disks,
@@ -178,6 +212,7 @@ struct PingResult {
     received: u32,
     packet_loss_percent: f32,
     average_latency_ms: Option<f64>,
+    jitter_ms: Option<f64>,
     latencies_ms: Vec<String>,
     measured_at_ms: u128,
 }
@@ -194,6 +229,7 @@ fn parse_ping_output(output: &str) -> (u32, Vec<String>, Vec<f64>) {
         replies += 1;
         if lower.contains("time<1ms") {
             displayed_times.push("<1 ms".to_string());
+            measured_times.push(0.5);
             continue;
         }
         let Some((_, time)) = lower.split_once("time=") else {
@@ -209,6 +245,16 @@ fn parse_ping_output(output: &str) -> (u32, Vec<String>, Vec<f64>) {
         displayed_times.push(format!("{value} ms"));
     }
     (replies, displayed_times, measured_times)
+}
+
+fn average_jitter_ms(samples: &[f64]) -> Option<f64> {
+    (samples.len() > 1).then(|| {
+        samples
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .sum::<f64>()
+            / (samples.len() - 1) as f64
+    })
 }
 
 #[tauri::command]
@@ -242,6 +288,7 @@ async fn run_ping_test(target: String) -> Result<PingResult, String> {
         let packet_loss_percent = (4 - received.min(4)) as f32 / 4.0 * 100.0;
         let average_latency_ms = (!measured_latencies.is_empty())
             .then(|| measured_latencies.iter().sum::<f64>() / measured_latencies.len() as f64);
+        let jitter_ms = average_jitter_ms(&measured_latencies);
 
         Ok(PingResult {
             target,
@@ -249,6 +296,7 @@ async fn run_ping_test(target: String) -> Result<PingResult, String> {
             received,
             packet_loss_percent,
             average_latency_ms,
+            jitter_ms,
             latencies_ms,
             measured_at_ms: unix_millis(),
         })
@@ -1199,6 +1247,372 @@ fn list_installed_steam_games() -> Result<Vec<InstalledSteamGame>, String> {
         }
     }
     detect_installed_steam_games(app_ids.into_iter().collect())
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedGameInstallation {
+    game_id: String,
+    install_path: String,
+    executable_path: String,
+    source: String,
+}
+
+fn game_executable_names(game_id: &str) -> Option<&'static [&'static str]> {
+    match game_id {
+        "cs2" => Some(&["cs2.exe"]),
+        "pubg" => Some(&["tslgame.exe"]),
+        "valorant" => Some(&["valorant-win64-shipping.exe"]),
+        "fc-online" => Some(&[
+            "fconline.exe",
+            "fc online.exe",
+            "fifaonline4.exe",
+            "fifa online 4.exe",
+            "fifa4zf.exe",
+            "fconline_x64.exe",
+        ]),
+        _ => None,
+    }
+}
+
+fn game_executable_name_matches(game_id: &str, file_name: &str) -> bool {
+    game_executable_names(game_id).is_some_and(|names| {
+        names
+            .iter()
+            .any(|name| file_name.eq_ignore_ascii_case(name))
+    })
+}
+
+fn executable_matches_game(game_id: &str, path: &Path) -> bool {
+    path.is_file()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| game_executable_name_matches(game_id, name))
+}
+
+fn game_executable_relative_paths(game_id: &str) -> &'static [&'static str] {
+    match game_id {
+        "cs2" => &["game/bin/win64/cs2.exe", "bin/win64/cs2.exe", "cs2.exe"],
+        "pubg" => &[
+            "TslGame/Binaries/Win64/TslGame.exe",
+            "Binaries/Win64/TslGame.exe",
+            "TslGame.exe",
+        ],
+        "valorant" => &[
+            "live/ShooterGame/Binaries/Win64/VALORANT-Win64-Shipping.exe",
+            "ShooterGame/Binaries/Win64/VALORANT-Win64-Shipping.exe",
+            "VALORANT-Win64-Shipping.exe",
+        ],
+        "fc-online" => &[
+            "FCOnline.exe",
+            "FIFAOnline4.exe",
+            "FIFA4zf.exe",
+            "FCOnline_x64.exe",
+            "FC Online.exe",
+            "FIFA ONLINE 4.exe",
+            "Game/FCOnline.exe",
+            "Game/FIFAOnline4.exe",
+            "Game/FIFA ONLINE 4.exe",
+            "Game/FIFA4zf.exe",
+        ],
+        _ => &[],
+    }
+}
+
+fn game_installation_from_executable(
+    game_id: &str,
+    executable: &Path,
+    source: &str,
+) -> Option<ManagedGameInstallation> {
+    if !executable_matches_game(game_id, executable) {
+        return None;
+    }
+    Some(ManagedGameInstallation {
+        game_id: game_id.to_string(),
+        install_path: executable.parent()?.to_string_lossy().into_owned(),
+        executable_path: executable.to_string_lossy().into_owned(),
+        source: source.to_string(),
+    })
+}
+
+fn find_game_executable(game_id: &str, roots: &[PathBuf]) -> Option<PathBuf> {
+    for root in roots {
+        for relative in game_executable_relative_paths(game_id) {
+            let candidate = root.join(relative);
+            if executable_matches_game(game_id, &candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn known_non_steam_game_roots(game_id: &str) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for env_key in ["ProgramFiles(x86)", "ProgramFiles"] {
+        if let Some(value) = std::env::var_os(env_key) {
+            let base = PathBuf::from(value);
+            match game_id {
+                "valorant" => roots.push(base.join("Riot Games").join("VALORANT")),
+                "fc-online" => {
+                    roots.push(base.join("Nexon").join("EA SPORTS FC ONLINE"));
+                    roots.push(base.join("Nexon").join("FIFA ONLINE 4"));
+                }
+                _ => {}
+            }
+        }
+    }
+    if game_id == "fc-online" {
+        if let Some(value) = std::env::var_os("SystemDrive") {
+            let root = PathBuf::from(format!(
+                "{}\\Nexon",
+                value.to_string_lossy().trim_end_matches('\\')
+            ));
+            roots.push(root.join("EA SPORTS FC ONLINE"));
+            roots.push(root.join("FIFA ONLINE 4"));
+        }
+        if let Some(value) = std::env::var_os("PUBLIC") {
+            let root = PathBuf::from(value).join("Nexon");
+            roots.push(root.join("EA SPORTS FC ONLINE"));
+            roots.push(root.join("FIFA ONLINE 4"));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use winreg::{enums::*, RegKey};
+        let registry_paths = match game_id {
+            "valorant" => &[
+                (
+                    r"Software\Riot Games\Riot Client",
+                    &["InstallPath", "InstallDir"][..],
+                ),
+                (
+                    r"Software\WOW6432Node\Riot Games\Riot Client",
+                    &["InstallPath", "InstallDir"][..],
+                ),
+            ][..],
+            "fc-online" => &[
+                (
+                    r"Software\Nexon\EA SPORTS FC ONLINE",
+                    &[
+                        "InstallPath",
+                        "InstallDir",
+                        "InstallLocation",
+                        "Install_Dir",
+                        "GamePath",
+                        "Path",
+                    ][..],
+                ),
+                (
+                    r"Software\Nexon\FIFA ONLINE 4",
+                    &[
+                        "InstallPath",
+                        "InstallDir",
+                        "InstallLocation",
+                        "Install_Dir",
+                        "GamePath",
+                        "Path",
+                    ][..],
+                ),
+                (
+                    r"Software\WOW6432Node\Nexon\EA SPORTS FC ONLINE",
+                    &[
+                        "InstallPath",
+                        "InstallDir",
+                        "InstallLocation",
+                        "Install_Dir",
+                        "GamePath",
+                        "Path",
+                    ][..],
+                ),
+                (
+                    r"Software\WOW6432Node\Nexon\FIFA ONLINE 4",
+                    &[
+                        "InstallPath",
+                        "InstallDir",
+                        "InstallLocation",
+                        "Install_Dir",
+                        "GamePath",
+                        "Path",
+                    ][..],
+                ),
+            ][..],
+            _ => &[],
+        };
+        for root_key in [
+            RegKey::predef(HKEY_CURRENT_USER),
+            RegKey::predef(HKEY_LOCAL_MACHINE),
+        ] {
+            for (key_path, value_names) in registry_paths {
+                if let Ok(key) = root_key.open_subkey(key_path) {
+                    for value_name in *value_names {
+                        if let Ok(value) = key.get_value::<String, _>(value_name) {
+                            roots.push(PathBuf::from(value));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    roots.retain(|root| root.is_dir());
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+#[tauri::command]
+fn detect_managed_game_installations(
+    manual_paths: std::collections::HashMap<String, String>,
+) -> Result<Vec<ManagedGameInstallation>, String> {
+    let mut installations = Vec::new();
+    let mut verified_manual_ids = std::collections::HashSet::new();
+    for (game_id, executable_path) in &manual_paths {
+        if game_executable_names(game_id).is_none() {
+            return Err(format!("Unsupported game identifier: {game_id}"));
+        }
+        let executable = PathBuf::from(executable_path);
+        if let Some(installation) =
+            game_installation_from_executable(game_id, &executable, "MANUAL")
+        {
+            verified_manual_ids.insert(game_id.clone());
+            installations.push(installation);
+        }
+    }
+
+    let steam_games = detect_installed_steam_games(vec![730, 578080])?;
+    for steam_game in steam_games {
+        let game_id = match steam_game.app_id {
+            730 => "cs2",
+            578080 => "pubg",
+            _ => continue,
+        };
+        if verified_manual_ids.contains(game_id) {
+            continue;
+        }
+        if let Some(executable) =
+            find_game_executable(game_id, &[PathBuf::from(&steam_game.install_path)])
+        {
+            if let Some(installation) =
+                game_installation_from_executable(game_id, &executable, "STEAM")
+            {
+                installations.push(installation);
+            }
+        }
+    }
+
+    for game_id in ["valorant", "fc-online"] {
+        if verified_manual_ids.contains(game_id) {
+            continue;
+        }
+        let roots = known_non_steam_game_roots(game_id);
+        if let Some(executable) = find_game_executable(game_id, &roots) {
+            if let Some(installation) = game_installation_from_executable(
+                game_id,
+                &executable,
+                if game_id == "valorant" {
+                    "RIOT"
+                } else {
+                    "NEXON"
+                },
+            ) {
+                installations.push(installation);
+            }
+        }
+    }
+
+    installations.sort_by(|left, right| left.game_id.cmp(&right.game_id));
+    installations.dedup_by(|left, right| left.game_id == right.game_id);
+    Ok(installations)
+}
+
+#[tauri::command]
+fn pick_managed_game_executable(game_id: String) -> Result<Option<String>, String> {
+    let names = game_executable_names(&game_id)
+        .ok_or_else(|| format!("Unsupported game identifier: {game_id}"))?;
+    #[cfg(target_os = "windows")]
+    {
+        let title = match game_id.as_str() {
+            "cs2" => "Select cs2.exe",
+            "pubg" => "Select TslGame.exe",
+            "valorant" => "Select VALORANT-Win64-Shipping.exe",
+            "fc-online" => "Select the EA SPORTS FC ONLINE game executable",
+            _ => "Select game executable",
+        };
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object System.Windows.Forms.OpenFileDialog; $dialog.Title = '{}'; $dialog.Filter = 'Game executable (*.exe)|*.exe'; $dialog.CheckFileExists = $true; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ [Console]::Write($dialog.FileName) }}",
+            title.replace('\'', "''")
+        );
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-STA", "-Command", &script])
+            .output()
+            .map_err(|error| format!("Could not open the game executable picker: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "The executable picker failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() {
+            return Ok(None);
+        }
+        if !names.iter().any(|name| {
+            Path::new(&path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|file_name| file_name.eq_ignore_ascii_case(name))
+        }) {
+            return Err(format!("That executable is not recognized as {game_id}."));
+        }
+        return Ok(Some(path));
+    }
+    #[cfg(not(target_os = "windows"))]
+    Err("The game executable picker is only available on Windows.".to_string())
+}
+
+#[tauri::command]
+fn launch_managed_game(
+    app: AppHandle,
+    game_id: String,
+    executable_path: String,
+) -> Result<(), String> {
+    if game_id == "cs2" {
+        return launch_cs2_game(app);
+    }
+    let executable = PathBuf::from(&executable_path);
+    if !executable_matches_game(&game_id, &executable) {
+        return Err(format!(
+            "The saved {game_id} executable is missing or could not be verified."
+        ));
+    }
+    let mut command = Command::new(&executable);
+    if game_id == "valorant" {
+        let riot_client = known_non_steam_game_roots("valorant")
+            .into_iter()
+            .map(|root| {
+                root.join("..")
+                    .join("Riot Client")
+                    .join("RiotClientServices.exe")
+            })
+            .find(|path| path.is_file())
+            .ok_or_else(|| {
+                "Riot Client was not found. Open VALORANT from Riot Client.".to_string()
+            })?;
+        command = Command::new(riot_client);
+        command.args(["--launch-product=valorant", "--launch-patchline=live"]);
+    } else {
+        let directory = executable
+            .parent()
+            .ok_or_else(|| "The game executable has no installation directory.".to_string())?;
+        command.current_dir(directory);
+    }
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Could not start the game launcher: {error}"))
 }
 
 #[tauri::command]
@@ -2203,6 +2617,9 @@ pub fn run() {
             launch_cs2_game,
             detect_installed_steam_games,
             list_installed_steam_games,
+            detect_managed_game_installations,
+            pick_managed_game_executable,
+            launch_managed_game,
             pick_cs2_installation_directory,
             run_hawk_eye_scan,
             cancel_hawk_eye_scan,
@@ -2236,8 +2653,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        has_cs2_launch_options, parse_app_manifest_install_dir, parse_ping_output,
-        parse_steam_library_paths, safe_steam_install_directory, vdf_values, CS2_STEAM_APP_ID,
+        average_jitter_ms, game_executable_name_matches, has_cs2_launch_options,
+        parse_app_manifest_install_dir, parse_ping_output, parse_steam_library_paths,
+        safe_steam_install_directory, vdf_values, CS2_STEAM_APP_ID,
     };
 
     #[test]
@@ -2251,7 +2669,27 @@ mod tests {
         let (replies, displayed, measured) = parse_ping_output(output);
         assert_eq!(replies, 2);
         assert_eq!(displayed, vec!["24 ms", "<1 ms"]);
-        assert_eq!(measured, vec![24.0]);
+        assert_eq!(measured, vec![24.0, 0.5]);
+        assert_eq!(average_jitter_ms(&measured), Some(23.5));
+    }
+
+    #[test]
+    fn computes_jitter_only_from_multiple_measured_replies() {
+        assert_eq!(average_jitter_ms(&[12.0, 16.0, 14.0]), Some(3.0));
+        assert_eq!(average_jitter_ms(&[12.0]), None);
+        assert_eq!(average_jitter_ms(&[]), None);
+    }
+
+    #[test]
+    fn recognizes_supported_non_steam_game_executables() {
+        assert!(game_executable_name_matches("fc-online", "FIFAOnline4.exe"));
+        assert!(game_executable_name_matches("fc-online", "fifa4zf.exe"));
+        assert!(game_executable_name_matches(
+            "valorant",
+            "VALORANT-Win64-Shipping.exe"
+        ));
+        assert!(!game_executable_name_matches("fc-online", "TslGame.exe"));
+        assert!(!game_executable_name_matches("unknown", "game.exe"));
     }
 
     #[test]
