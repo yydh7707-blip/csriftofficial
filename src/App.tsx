@@ -29,7 +29,7 @@ const faqs = [
 ]
 
 const steps = [
-  ['01', 'DOWNLOAD', 'Get CSRIFT from the official release page.'],
+  ['01', 'DOWNLOAD', 'Download the Windows x64 installer directly from CSRIFT.'],
   ['02', 'SYSTEM SCAN', 'Review the environment and available system information.'],
   ['03', 'ANALYZE', 'Understand findings and read the recommendations.'],
   ['04', 'OPTIMIZE', 'Choose which supported changes you want to apply.'],
@@ -196,7 +196,7 @@ function Safety() {
 }
 
 function Download() {
-  return <section className="download-section" id="download"><div className="download-art" aria-hidden="true" /><div className="download-content"><span className="eyebrow"><span className="eyebrow-mark" /> YOUR NEXT MOVE</span><h2>READY TO<br /><span>TAKE CONTROL?</span></h2><p>Your setup. Your settings. Your advantage.</p><button className="button button-disabled" disabled aria-disabled="true">WINDOWS RELEASE <span className="coming-soon">COMING SOON</span></button><span className="download-note">The CSRIFT installer is not available yet. Check back for confirmed release details.</span></div><div className="download-corner">CSRIFT&nbsp; / &nbsp;WINDOWS</div></section>
+  return <section className="download-section" id="download"><div className="download-art" aria-hidden="true" /><div className="download-content"><span className="eyebrow"><span className="eyebrow-mark" /> YOUR NEXT MOVE</span><h2>READY TO<br /><span>TAKE CONTROL?</span></h2><p>Your setup. Your settings. Your advantage.</p><a className="button button-primary download-button" href="/downloads/CSRIFT_0.1.0_x64-setup.exe" download><span>DOWNLOAD FOR WINDOWS <small>VERSION 0.1.0 · X64</small></span><Arrow diagonal /></a><span className="download-note">Windows installer · 2.3 MB · Distributed directly by CSRIFT. Windows may show a security prompt because this early release is not code-signed.</span></div><div className="download-corner">CSRIFT&nbsp; / &nbsp;WINDOWS</div></section>
 }
 
 function FAQ() {
@@ -220,7 +220,7 @@ const policies = {
     intro: 'This notice describes the privacy approach for the CSRIFT public website at csrift.xyz.',
     sections: [
       ['Website data', 'This website is a static product information site. It does not provide account registration, sign-in, contact forms, or backend services. We do not intentionally collect personal information through this site.'],
-      ['Downloads and analytics', 'No CSRIFT installer is currently offered from this website. We do not claim to operate analytics, advertising, or download-tracking services here. Your browser or hosting provider may process standard connection data to deliver the site under its own policies.'],
+      ['Downloads and analytics', 'The website offers the CSRIFT Windows installer as a static file download. CSRIFT does not operate download analytics or advertising on this site. Your browser and hosting provider may process standard connection data to deliver the site and file under their own policies.'],
       ['External services', 'The site may load web fonts from Google Fonts. Requests to that service are handled according to Google’s privacy terms. You can use browser settings or extensions to limit external requests; fallback system fonts are provided.'],
       ['Changes to this notice', 'If the website or its data practices change, this page will be updated before new collection practices are introduced. A future CSRIFT application may have a separate privacy notice.'],
       ['Contact', 'A dedicated privacy contact has not yet been published. Please check this page for updates.'],
@@ -233,7 +233,7 @@ const policies = {
     intro: 'These terms apply to your use of the CSRIFT public website at csrift.xyz.',
     sections: [
       ['Website information', 'This site provides general product information about CSRIFT. Features and interface visuals may be previews of a planned product, not a representation that a release is currently available. The website does not make performance, FPS, or network-improvement guarantees.'],
-      ['No software download', 'There is currently no CSRIFT installer available from this website. Do not rely on third-party files claiming to be an official CSRIFT release.'],
+      ['Software download', 'The CSRIFT Windows x64 installer is provided as-is from this website. Only download it from csrift.xyz. This early release is not code-signed, so Windows may display an unknown-publisher warning. Review any Windows prompts before choosing whether to run the installer.'],
       ['Independent product', 'CSRIFT is an independent project. It is not affiliated with, endorsed by, or sponsored by Valve Corporation. Counter-Strike 2 and Valve are the property of their respective owners.'],
       ['Use of this website', 'Do not misuse the website or attempt to disrupt its availability. Website content is provided for general information and may be updated as product details are confirmed.'],
       ['Updates', 'These terms may be updated as the website or product changes. Updated terms will be published on this page.'],

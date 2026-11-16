@@ -11,6 +11,7 @@ import {
 } from 'lucide-react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { invoke, isTauri } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react'
 
 type PageId = 'dashboard' | 'fps' | 'network' | 'monitor' | 'config' | 'optimize' | 'recovery' | 'settings'
@@ -51,7 +52,13 @@ type ConfigProfile = { id: string; name: string; createdAtMs: number; backupId: 
 type StartupEntry = { name: string; command: string; source: string }
 type TempScan = { directory: string; eligibleFiles: number; totalBytes: number }
 type PowerPlan = { name: string | null; guid: string | null; available: boolean }
+type Cs2OptimizationStatus = { gameModeEnabled: boolean | null; activePowerPlan: PowerPlan; highPerformanceAvailable: boolean; canRestoreGameMode: boolean; canRestorePowerPlan: boolean }
+type Cs2OptimizationSetting = 'gameMode' | 'powerPlan'
 type DnsServer = { address: string }
+type GameDetection = { detected: boolean; installPath: string | null; steamPaths: string[]; libraryPaths: string[]; executableFound: boolean; configFiles: string[]; launchOptionsFound: boolean; steamRunning: boolean; source: string | null }
+type ScanProgress = { step: string; percent: number }
+type ScanFinding = { label: string; status: 'GOOD' | 'NEEDS ATTENTION' | 'NOT SUPPORTED'; detail: string; recommendation: string }
+type ScanReport = { completedAtMs: number; durationMs: number; findings: ScanFinding[]; goodCount: number; attentionCount: number; unsupportedCount: number }
 type DesktopSettings = { accent: 'ember' | 'amber'; reduceMotion: boolean; introEnabled: boolean; notificationsEnabled: boolean }
 type Toast = { id: number; title: string; message: string; tone: 'success' | 'error' | 'info' }
 type ActivityItem = { id: number; title: string; detail: string; time: number; tone: 'success' | 'info' }
@@ -165,9 +172,9 @@ function AppCard({ className = '', children }: { className?: string; children: R
 }
 
 function DashboardPage({
-  snapshot, history, latestPing, config, onPage,
+  snapshot, history, latestPing, config, gameDetection, onPage, onGameDetection,
 }: {
-  snapshot: SystemSnapshot | null; history: number[]; latestPing: PingResult | null; config: ConfigStatus | null; onPage: (page: PageId) => void
+  snapshot: SystemSnapshot | null; history: number[]; latestPing: PingResult | null; config: ConfigStatus | null; gameDetection: GameDetection | null; onPage: (page: PageId) => void; onGameDetection: () => void
 }) {
   const systemClear = snapshot != null && snapshot.cpuUsagePercent != null && snapshot.cpuUsagePercent < 85 && snapshot.memoryUsagePercent != null && snapshot.memoryUsagePercent < 92
   return (
@@ -191,6 +198,16 @@ function DashboardPage({
         <span className="cs-status"><i className={snapshot?.cs2Running ? 'is-active' : ''} /><span>CS2 {snapshot ? snapshot.cs2Running ? 'RUNNING' : 'NOT RUNNING' : 'CHECKING'}</span></span>
         <span className="ribbon-spacer" />
         <span className="local-tag"><ShieldCheck size={13} /> YOUR PC ONLY</span>
+      </div>
+
+      <div className="detection-featured-wrap">
+        <span className="recommended-badge"><Sparkles size={11} /> RECOMMENDED</span>
+        <button className="detection-featured-card" onClick={onGameDetection} aria-label="Open recommended Game Detection">
+          <span className="detection-featured-icon"><Gamepad2 size={20} /></span>
+          <span className="detection-featured-copy"><b>GAME DETECTION</b><small>Find and verify your CS2 installation before scanning.</small></span>
+          <span className={`detection-featured-status ${gameDetection?.detected ? 'is-found' : ''}`}><i />{gameDetection?.detected ? 'CS2 VERIFIED' : 'START HERE'}</span>
+          <span className="detection-featured-action">OPEN GAME DETECTION <ArrowRight size={15} /></span>
+        </button>
       </div>
 
       <div className="metric-grid">
@@ -345,12 +362,12 @@ function OptimizePage({ startup, scan, powerPlan, busy, onRefresh, onScan, onCle
   return (
     <div className="page-stack">
       <SectionTitle overline="REVIEW / USER-CONTROLLED" title="Deliberate, not destructive." detail="Inspect startup items and clean only individual temporary files older than one day. Important services are never stopped." action={<button className="button button-outline" onClick={onRefresh} disabled={busy != null}><RefreshCw size={14} /> REFRESH REVIEW</button>} />
-      <AppCard className="optimize-principle"><div className="optimize-shield"><ShieldCheck size={21} /></div><div><span className="eyebrow"><i /> SAFETY / FIRST</span><h3>Review what will change. Every time.</h3><p>CSRIFT does not apply background tweaks, edit your registry, stop Windows services, or make changes without your explicit confirmation.</p></div><span className="policy-badge">NO SILENT CHANGES</span></AppCard>
+      <AppCard className="optimize-principle"><div className="optimize-shield"><ShieldCheck size={21} /></div><div><span className="eyebrow"><i /> SAFETY / FIRST</span><h3>Review what will change. Every time.</h3><p>CSRIFT only changes the listed Game Mode or power-plan setting after confirmation, saves the previous value for restore, and never stops Windows services.</p></div><span className="policy-badge">NO SILENT CHANGES</span></AppCard>
       <div className="optimize-grid">
         <AppCard className="cleanup-card"><div className="card-heading"><div><span className="eyebrow"><i /> TEMPORARY FILES / WINDOWS</span><h3>A measured cleanup.</h3></div><Trash2 size={17} className="muted-icon" /></div><p>Review files directly inside your user temporary folder that have been untouched for more than 24 hours. Active files, folders, and system locations are skipped.</p><div className="temp-summary"><div><span>ELIGIBLE FILES</span><b>{scan?.eligibleFiles ?? '—'}</b></div><div><span>SPACE TO REVIEW</span><b>{scan ? bytes(scan.totalBytes) : '—'}</b></div></div><div className="temp-path">{scan?.directory ?? 'Folder scan required'}</div><div className="cleanup-actions"><button className="button button-outline" onClick={() => void onScan()} disabled={busy != null}><Search size={14} /> {busy === 'scan' ? 'SCANNING…' : 'SCAN AGAIN'}</button><button className="button button-primary" onClick={() => void onCleanup()} disabled={!scan?.eligibleFiles || busy != null}><Trash2 size={14} /> {busy === 'cleanup' ? 'CLEANING…' : 'REVIEW & CLEAN'}</button></div><span className="cleanup-footnote"><Shield size={12} /> Files in use or less than 24 hours old are skipped.</span></AppCard>
         <AppCard className="startup-card"><div className="card-heading"><div><span className="eyebrow"><i /> LOGIN / STARTUP ITEMS</span><h3>Your startup, in plain sight.</h3></div><Settings2 size={17} className="muted-icon" /></div><p>Entries are read from Windows startup registry keys. CSRIFT will not disable or remove an item automatically.</p>{startup?.length ? <div className="startup-list">{startup.map((entry) => <div className="startup-row" key={`${entry.source}-${entry.name}`}><span className="startup-icon"><Activity size={13} /></span><span><b>{entry.name}</b><small>{entry.source} · {entry.command}</small></span><span className="read-only-badge">REVIEW</span></div>)}</div> : startup ? <EmptyState icon={CheckCircle2} title="No registry startup entries found" detail="This scan checks the current-user and system Run keys only." /> : <div className="row-placeholder"><LoaderCircle size={14} className="spin" />Reading startup registry entries</div>}<div className="read-only-note"><ShieldCheck size={14} /><span>Read-only. To manage login startup, use Windows Settings → Apps → Startup.</span></div></AppCard>
       </div>
-      <AppCard className="power-note"><span className="power-icon"><Zap size={15} /></span><div><b>Windows power plan · {powerPlan?.name ?? 'unavailable'}</b><p>{powerPlan?.guid ? `Active plan ${powerPlan.guid}.` : 'The active plan could not be identified.'} CSRIFT reads this setting only and does not change it.</p></div><span className="not-scanned">{powerPlan?.available ? 'READ ONLY' : 'UNAVAILABLE'}</span></AppCard>
+      <AppCard className="power-note"><span className="power-icon"><Zap size={15} /></span><div><b>Windows power plan · {powerPlan?.name ?? 'unavailable'}</b><p>{powerPlan?.guid ? `Active plan ${powerPlan.guid}.` : 'The active plan could not be identified.'} The CS2 session panel can activate the existing High performance plan after confirmation and save this plan for restoration.</p></div><span className="not-scanned">{powerPlan?.available ? 'REVIEW & CONFIRM' : 'UNAVAILABLE'}</span></AppCard>
     </div>
   )
 }
@@ -408,6 +425,138 @@ function BootIntro({ onSkip, reduceMotion }: { onSkip: () => void; reduceMotion:
   return <motion.div className="boot-intro" initial={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: reduceMotion ? 0.15 : 0.5 }}><motion.div className="intro-eye" initial={{ opacity: 0, scale: .94, filter: 'blur(10px)' }} animate={{ opacity: .8, scale: 1, filter: 'blur(0px)' }} transition={{ duration: reduceMotion ? .15 : .65 }}><img src="/images/csrift-eyes-cutout.png" alt="" /></motion.div><motion.div className="intro-wordmark" initial={{ opacity: 0, y: 7, filter: 'blur(7px)' }} animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }} transition={{ delay: reduceMotion ? 0 : .3, duration: reduceMotion ? .15 : .45 }}><span>C</span><b>CSRIFT</b></motion.div><div className="intro-progress"><i /></div><button className="intro-skip" onClick={onSkip}>SKIP INTRO <ArrowRight size={13} /></button></motion.div>
 }
 
+function GameDetectionScreen({ detection, busy, progress, error, onFind, onPick, onContinue, onScan, onOptimize, reduceMotion }: {
+  detection: GameDetection | null
+  busy: boolean
+  progress: ScanProgress | null
+  error: string | null
+  onFind: (path?: string) => Promise<void>
+  onPick: () => Promise<void>
+  onContinue: () => void
+  onScan: () => void
+  onOptimize: () => void
+  reduceMotion: boolean
+}) {
+  const [posterUnavailable, setPosterUnavailable] = useState(false)
+  const detected = detection?.detected === true
+  return (
+    <motion.main className="game-entry-screen" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: reduceMotion ? .1 : .45 }}>
+      <div className="game-entry-grid" />
+      <button className="button button-outline game-optimize-trigger" onClick={onOptimize}><Zap size={14} /> OPTIMIZE FOR CS2</button>
+      <div className="game-entry-copy">
+        <span className="recommended-badge detection-recommended-badge"><Sparkles size={11} /> RECOMMENDED FIRST STEP</span>
+        <span className="eyebrow"><i /> GAME DETECTION / 001</span>
+        <h1>YOUR NEXT<br /><span>ROUND STARTS HERE.</span></h1>
+        <p>Find your local Counter-Strike 2 installation. A scan reads local game and system data and sends diagnostic pings to reachable public resolver endpoints.</p>
+        <div className="game-entry-assurance"><span><ShieldCheck size={14} /> LOCAL FILE CHECK</span><span><Activity size={14} /> NO GAME MODIFICATION</span></div>
+      </div>
+      <motion.section className={`game-detection-card ${detected ? 'is-detected' : ''}`} initial={{ opacity: 0, y: reduceMotion ? 0 : 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: reduceMotion ? 0 : .12, duration: .5 }}>
+        <div className={`game-poster ${posterUnavailable ? 'poster-fallback' : ''}`}>
+          {!posterUnavailable ? <img src="/assets/cs2-cover.png" alt="Counter-Strike 2 cover art" onError={() => setPosterUnavailable(true)} /> : <div className="poster-fallback-art"><span>730</span><b>CS2</b><i>COUNTER-STRIKE<br />GAME DETECTION</i><small>GAME ARTWORK NOT INCLUDED</small></div>}
+          <span className="poster-index">CSRIFT / 730</span>
+        </div>
+        <div className="game-card-meta"><span className={`game-state-tag ${detected ? 'detected' : detection ? 'not-found' : ''}`}><i />{busy ? 'SEARCHING' : detected ? '<DETECTED>' : detection ? 'NOT FOUND' : 'READY TO SEARCH'}</span><span className="eyebrow"><i /> STEAM APP ID / 730</span></div>
+        <h2>COUNTER-STRIKE 2</h2>
+        <p className="game-detection-label">COUNTER-STRIKE GAME DETECTION</p>
+        {detected && detection.installPath && <div className="detected-path"><span>VERIFIED INSTALLATION</span><code title={detection.installPath}>{detection.installPath}</code><small>{detection.configFiles.length} CS2 settings file{detection.configFiles.length === 1 ? '' : 's'} · {detection.libraryPaths.length} Steam librar{detection.libraryPaths.length === 1 ? 'y' : 'ies'} checked</small></div>}
+        {busy && <div className="game-search-progress"><div className="game-search-label"><LoaderCircle size={13} className="spin" /><span>{progress?.step ?? 'SEARCHING FOR STEAM'}</span><b>{progress?.percent ?? 0}%</b></div><div className="progress-track"><div className="progress-fill" style={{ width: `${progress?.percent ?? 0}%` }} /></div></div>}
+        {error && <p className="game-detection-error"><CircleAlert size={14} />{error}</p>}
+        <div className="game-entry-actions">
+          {detected
+            ? <button className="button button-primary game-primary-action" onClick={onScan}><EyeMark /> SCAN NOW <ArrowRight size={15} /></button>
+            : <button className="button button-primary game-primary-action" onClick={() => void onFind()} disabled={busy}><Search size={16} /> {busy ? 'SEARCHING…' : 'FIND CS2'} <ArrowRight size={15} /></button>}
+          {!detected && <button className="button button-outline game-manual-action" onClick={() => void onPick()} disabled={busy}><ExternalLink size={14} /> SELECT INSTALLATION FOLDER</button>}
+        </div>
+        {detection && !detected && !busy && <button className="game-continue-link" onClick={onContinue}>CONTINUE WITHOUT CS2 <ArrowRight size={13} /></button>}
+      </motion.section>
+      <div className="game-entry-footer"><span>CSRIFT / LOCAL GAME CHECK</span><span>NO MEMORY ACCESS · NO INJECTION · NO ANTICHEAT INTERFERENCE</span></div>
+    </motion.main>
+  )
+}
+
+function HawkEyeOverlay({ progress, report, error, reduceMotion, gameDetected, onCancel, onContinue, onLaunch, onRetry, onOptimize }: {
+  progress: ScanProgress
+  report: ScanReport | null
+  error: string | null
+  reduceMotion: boolean
+  gameDetected: boolean
+  onCancel: () => void
+  onContinue: () => void
+  onLaunch: () => void
+  onRetry: () => void
+  onOptimize: () => void
+}) {
+  const completed = report != null
+  return (
+    <motion.section className={`hawk-overlay ${completed ? 'scan-complete' : ''}`} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: reduceMotion ? .12 : .42 }} aria-label={completed ? 'Scan results' : 'Hawk Eye scan in progress'}>
+      <div className="hawk-backdrop-grid" />
+      <motion.div className="hawk-eye-glow" animate={reduceMotion ? {} : { opacity: [.46, .74, .52], scale: [1, 1.06, 1] }} transition={{ duration: 5.2, repeat: Infinity, ease: 'easeInOut' }} />
+      <AnimatePresence mode="wait">
+        {completed ? (
+          <motion.div key="results" className="hawk-results" initial={{ opacity: 0, y: reduceMotion ? 0 : 14 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={{ duration: reduceMotion ? .1 : .35 }}>
+            <div className="hawk-results-heading"><span className="eyebrow"><i /> HAWK EYE / LOCAL SYSTEM REVIEW</span><span className="scan-finished-tag"><CheckCircle2 size={13} /> COMPLETE</span></div>
+            <h1>SCAN <span>COMPLETED.</span></h1>
+            <p className="hawk-results-summary">{report.goodCount} GOOD <i /> {report.attentionCount} NEEDS ATTENTION <i /> {report.unsupportedCount} NOT SUPPORTED <i /> {Math.max(5, report.durationMs / 1000).toFixed(1)} SEC</p>
+            <div className="hawk-findings">{report.findings.map((item) => <article className={`hawk-finding finding-${item.status.toLowerCase().replaceAll(' ', '-')}`} key={item.label}><span className="finding-state"><i />{item.status}</span><div><h3>{item.label}</h3><p>{item.detail}</p><small>{item.recommendation}</small></div></article>)}</div>
+            {error && <p className="hawk-inline-error"><CircleAlert size={14} />{error}</p>}
+            <div className="hawk-result-actions">{gameDetected && <button className="button button-primary" onClick={onLaunch}><Gamepad2 size={14} /> LAUNCH COUNTER-STRIKE 2 <ArrowRight size={14} /></button>}<button className="button button-outline" onClick={onContinue}>OPEN DASHBOARD <ArrowRight size={14} /></button><button className="button button-outline" onClick={onRetry}><RefreshCw size={14} /> SCAN AGAIN</button><button className="button button-outline" onClick={onOptimize}><Zap size={14} /> OPTIMIZE FOR CS2</button></div>
+            <p className="hawk-readonly-note"><ShieldCheck size={13} /> No files or settings were changed. Live ping samples use public resolver endpoints, not your CS2 match server.</p>
+          </motion.div>
+        ) : (
+          <motion.div key="scan" className="hawk-scanning" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0, scale: .985 }} transition={{ duration: reduceMotion ? .1 : .3 }}>
+            <motion.img className="hawk-eye-art" src="/images/csrift-eyes-cutout.png" alt="" initial={{ opacity: 0, scale: reduceMotion ? 1 : .92, filter: 'blur(10px)' }} animate={reduceMotion ? { opacity: .9, filter: 'blur(0px)' } : { opacity: [.75, 1, .84], scale: [1, 1.025, 1], filter: 'blur(0px)' }} transition={reduceMotion ? { duration: .12 } : { opacity: { duration: 4.2, repeat: Infinity, ease: 'easeInOut' }, scale: { duration: 6, repeat: Infinity, ease: 'easeInOut' }, filter: { duration: .6 } }} />
+            <motion.i className="hawk-scan-line" animate={reduceMotion ? { opacity: .3 } : { y: ['-36vh', '36vh'], opacity: [.15, .75, .15] }} transition={reduceMotion ? { duration: .1 } : { duration: 3.8, repeat: Infinity, ease: 'easeInOut' }} />
+            <span className="eyebrow"><i /> CSRIFT / HAWK EYE SYSTEM CHECK</span>
+            <h1>SCANNING<span className="scan-ellipsis">...</span></h1>
+            <motion.p key={progress.step} className="hawk-stage-copy" initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: reduceMotion ? .1 : .24 }}>{progress.step}</motion.p>
+            <div className="hawk-progress"><div className="hawk-progress-label"><span>LOCAL ANALYSIS</span><b>{progress.percent}%</b></div><div className="progress-track"><motion.div className="progress-fill" animate={{ width: `${progress.percent}%` }} transition={{ duration: reduceMotion ? .1 : .3, ease: 'easeOut' }} /></div></div>
+            <button className="hawk-cancel" onClick={onCancel}><X size={13} /> CANCEL SCAN</button>
+            {error && <p className="hawk-inline-error"><CircleAlert size={14} />{error}</p>}
+            <p className="hawk-safety-caption">READ-ONLY REVIEW / NO GAME PROCESS INTERACTION</p>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </motion.section>
+  )
+}
+
+function Cs2OptimizationPanel({ status, loading, busy, error, onClose, onApply, onRestore }: {
+  status: Cs2OptimizationStatus | null
+  loading: boolean
+  busy: string | null
+  error: string | null
+  onClose: () => void
+  onApply: (setting: Cs2OptimizationSetting) => void
+  onRestore: (setting: Cs2OptimizationSetting) => void
+}) {
+  const activePlanIsHighPerformance = status?.activePowerPlan.guid?.toLowerCase() === '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c'
+  return (
+    <motion.div className="optimization-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+      <motion.section className="optimization-panel" role="dialog" aria-modal="true" aria-labelledby="optimization-title" initial={{ opacity: 0, y: 12, scale: .985 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 8, scale: .99 }}>
+        <div className="optimization-panel-heading"><span className="modal-icon"><Zap size={19} /></span><button className="icon-action" aria-label="Close CS2 optimization panel" onClick={onClose}><X size={15} /></button></div>
+        <span className="eyebrow"><i /> USER-CONTROLLED / REVERSIBLE</span>
+        <h2 id="optimization-title">CS2 session profile.</h2>
+        <p className="optimization-intro">Choose each Windows setting separately. CSRIFT saves its current value before changing it, and does not promise a specific FPS or latency improvement.</p>
+        {loading && <div className="optimization-loading"><LoaderCircle size={14} className="spin" /> READING CURRENT WINDOWS SETTINGS</div>}
+        {error && <p className="optimization-error"><CircleAlert size={14} />{error}</p>}
+        {status && <div className="optimization-settings">
+          <article className="optimization-setting">
+            <span className="optimization-setting-icon"><Gamepad2 size={17} /></span>
+            <div className="optimization-setting-copy"><b>WINDOWS GAME MODE</b><p>{status.gameModeEnabled == null ? 'Current state is not reported.' : status.gameModeEnabled ? 'Currently enabled for this Windows user.' : 'Currently disabled for this Windows user.'} Enabling it changes one current-user setting.</p><small>{status.canRestoreGameMode ? 'PREVIOUS VALUE SAVED · RESTORE AVAILABLE' : 'NO CSRIFT CHANGE TO RESTORE'}</small></div>
+            <button className={`button ${status.canRestoreGameMode ? 'button-outline' : 'button-primary'}`} disabled={busy != null || loading || (status.gameModeEnabled === true && !status.canRestoreGameMode)} onClick={() => status.canRestoreGameMode ? onRestore('gameMode') : onApply('gameMode')}>{busy === 'gameMode' ? <LoaderCircle size={13} className="spin" /> : status.canRestoreGameMode ? <RotateCcw size={13} /> : <Zap size={13} />}{status.canRestoreGameMode ? 'RESTORE' : status.gameModeEnabled ? 'ENABLED' : 'ENABLE'}</button>
+          </article>
+          <article className="optimization-setting">
+            <span className="optimization-setting-icon"><Zap size={17} /></span>
+            <div className="optimization-setting-copy"><b>HIGH PERFORMANCE POWER PLAN</b><p>{status.activePowerPlan.name ?? 'Current plan unavailable'}{activePlanIsHighPerformance ? ' · already active' : ''}. This plan may use more power and increase heat or fan activity.</p><small>{status.canRestorePowerPlan ? 'PREVIOUS PLAN SAVED · RESTORE AVAILABLE' : 'NO CSRIFT CHANGE TO RESTORE'}</small></div>
+            <button className={`button ${status.canRestorePowerPlan ? 'button-outline' : 'button-primary'}`} disabled={busy != null || loading || (!status.canRestorePowerPlan && (!status.highPerformanceAvailable || activePlanIsHighPerformance))} onClick={() => status.canRestorePowerPlan ? onRestore('powerPlan') : onApply('powerPlan')}>{busy === 'powerPlan' ? <LoaderCircle size={13} className="spin" /> : status.canRestorePowerPlan ? <RotateCcw size={13} /> : <Zap size={13} />}{status.canRestorePowerPlan ? 'RESTORE' : status.highPerformanceAvailable ? activePlanIsHighPerformance ? 'ACTIVE' : 'APPLY' : 'UNAVAILABLE'}</button>
+          </article>
+        </div>}
+        <div className="optimization-panel-footer"><ShieldCheck size={14} /><span>No services or network settings are changed. Only the two settings shown here may be changed, and every apply or restore requires confirmation.</span></div>
+      </motion.section>
+    </motion.div>
+  )
+}
+
 const activityStorageKey = 'csrift-desktop-activity-v1'
 
 function readActivity(): ActivityItem[] {
@@ -432,6 +581,15 @@ function readPingHistory(): PingResult[] {
 
 function DesktopApp() {
   const [page, setPage] = useState<PageId>('dashboard')
+  const [entryScreen, setEntryScreen] = useState(true)
+  const [gameDetection, setGameDetection] = useState<GameDetection | null>(null)
+  const [detectionBusy, setDetectionBusy] = useState(false)
+  const [detectionProgress, setDetectionProgress] = useState<ScanProgress | null>(null)
+  const [detectionError, setDetectionError] = useState<string | null>(null)
+  const [hawkEyeVisible, setHawkEyeVisible] = useState(false)
+  const [hawkEyeProgress, setHawkEyeProgress] = useState<ScanProgress>({ step: 'INITIALIZING SCAN', percent: 0 })
+  const [hawkEyeReport, setHawkEyeReport] = useState<ScanReport | null>(null)
+  const [hawkEyeError, setHawkEyeError] = useState<string | null>(null)
   const [snapshot, setSnapshot] = useState<SystemSnapshot | null>(null)
   const [telemetryHistory, setTelemetryHistory] = useState<number[]>([])
   const [latestPing, setLatestPing] = useState<PingResult | null>(null)
@@ -442,6 +600,11 @@ function DesktopApp() {
   const [startupEntries, setStartupEntries] = useState<StartupEntry[] | null>(null)
   const [tempScan, setTempScan] = useState<TempScan | null>(null)
   const [activePowerPlan, setActivePowerPlan] = useState<PowerPlan | null>(null)
+  const [optimizationStatus, setOptimizationStatus] = useState<Cs2OptimizationStatus | null>(null)
+  const [optimizationOpen, setOptimizationOpen] = useState(false)
+  const [optimizationLoading, setOptimizationLoading] = useState(false)
+  const [optimizationBusy, setOptimizationBusy] = useState<string | null>(null)
+  const [optimizationError, setOptimizationError] = useState<string | null>(null)
   const [settings, setSettings] = useState<DesktopSettings>(defaultSettings)
   const [dataPath, setDataPath] = useState<string | null>(null)
   const [activity, setActivity] = useState<ActivityItem[]>(readActivity)
@@ -515,33 +678,19 @@ function DesktopApp() {
     }
   }, [notify])
 
-  useEffect(() => {
-    let active = true
-    void (async () => {
-      const [savedSettings, savedDataPath] = await Promise.all([
-        invoke<DesktopSettings>('load_desktop_settings'),
-        invoke<string>('get_local_data_directory'),
-      ])
-      if (!active) return
-      setSettings(savedSettings)
-      setDataPath(savedDataPath)
-      setIntroEnabledOnBoot(savedSettings.introEnabled)
-      await Promise.all([refreshSnapshot(true), refreshConfig(), refreshStartup(), refreshTempScan(true), refreshPowerPlan()])
-      if (active) {
-        if (savedSettings.introEnabled) {
-          window.setTimeout(() => { if (active) setBooting(false) }, savedSettings.reduceMotion ? 350 : 1450)
-        } else {
-          setBooting(false)
-        }
-      }
-    })().catch((error: unknown) => {
-      if (active) {
-        notify('CSRIFT could not load local settings', String(error), 'error')
-        setBooting(false)
-      }
-    })
-    return () => { active = false }
-  }, [notify, refreshConfig, refreshPowerPlan, refreshSnapshot, refreshStartup, refreshTempScan])
+  const refreshOptimizationStatus = useCallback(async () => {
+    setOptimizationLoading(true)
+    setOptimizationError(null)
+    try {
+      setOptimizationStatus(await invoke<Cs2OptimizationStatus>('get_cs2_optimization_status'))
+    } catch (error) {
+      setOptimizationStatus(null)
+      setOptimizationError(String(error))
+      notify('Optimization status unavailable', String(error), 'error')
+    } finally {
+      setOptimizationLoading(false)
+    }
+  }, [notify])
 
   useEffect(() => {
     try { localStorage.setItem(activityStorageKey, JSON.stringify(activity)) } catch { /* Activity stays available for this session. */ }
@@ -568,6 +717,149 @@ function DesktopApp() {
     await invoke('save_desktop_settings', { settings: next })
     setSettings(next)
   }
+
+  const detectGame = useCallback(async (manualPath?: string) => {
+    setDetectionBusy(true)
+    setDetectionError(null)
+    setDetectionProgress({ step: 'SEARCHING FOR STEAM', percent: 0 })
+    let unlisten: (() => void) | undefined
+    try {
+      unlisten = await listen<ScanProgress>('game-detection-progress', (event) => setDetectionProgress(event.payload))
+      const detection = await invoke<GameDetection>('detect_cs2_installation', { manualPath: manualPath ?? null })
+      setGameDetection(detection)
+      setDetectionProgress({ step: 'DETECTION COMPLETE', percent: 100 })
+      if (manualPath && !detection.detected) {
+        setDetectionError('That folder does not contain a verified CS2 executable. Select the Counter-Strike 2 installation folder.')
+      }
+    } catch (error) {
+      setDetectionError(String(error))
+      notify('CS2 detection failed', String(error), 'error')
+    } finally {
+      unlisten?.()
+      setDetectionBusy(false)
+    }
+  }, [notify])
+
+  const pickGameFolder = async () => {
+    try {
+      const selectedPath = await invoke<string | null>('pick_cs2_installation_directory')
+      if (selectedPath) await detectGame(selectedPath)
+    } catch (error) {
+      setDetectionError(String(error))
+      notify('Could not select the CS2 folder', String(error), 'error')
+    }
+  }
+
+  const openOptimization = () => {
+    setOptimizationOpen(true)
+    void refreshOptimizationStatus()
+  }
+
+  const confirmOptimizationChange = (setting: Cs2OptimizationSetting, restore = false) => {
+    const gameMode = setting === 'gameMode'
+    setConfirmAction({
+      title: restore
+        ? gameMode ? 'Restore the previous Game Mode value?' : 'Restore the previous Windows power plan?'
+        : gameMode ? 'Enable Windows Game Mode for CS2?' : 'Switch to High performance for CS2?',
+      detail: restore
+        ? gameMode
+          ? 'CSRIFT will restore the exact current-user Game Mode registry value captured before its change. If Windows changed the value since then, CSRIFT will leave it untouched.'
+          : 'CSRIFT will restore the power-plan GUID captured before its change. If the active plan changed outside CSRIFT, CSRIFT will leave it untouched.'
+        : gameMode
+          ? 'CSRIFT will save the current Game Mode value in its local recovery data, then set the current Windows user’s Game Mode value to enabled. No game files or running processes are touched.'
+          : 'CSRIFT will save the currently active power-plan GUID locally, then activate the existing built-in High performance plan. It may increase power use, heat, or fan activity; CSRIFT will not create or tune a plan.',
+      confirmLabel: restore ? 'RESTORE SAVED VALUE' : 'BACK UP & APPLY',
+      run: async () => {
+        setOptimizationBusy(setting)
+        try {
+          await invoke(restore ? 'restore_cs2_optimization' : 'apply_cs2_optimization', { setting })
+          await refreshOptimizationStatus()
+          await refreshPowerPlan()
+          const label = gameMode ? 'Windows Game Mode' : 'Windows power plan'
+          recordActivity(restore ? `${label} restored` : `${label} updated for CS2`, restore ? 'Previous value restored from the local CSRIFT backup.' : 'Previous value saved locally before the change.')
+          notify(restore ? 'Previous setting restored' : 'CS2 setting applied', `${label} was ${restore ? 'restored' : 'updated'}.`, 'success')
+        } catch (error) {
+          notify(restore ? 'Setting was not restored' : 'Setting was not applied', String(error), 'error')
+        } finally {
+          setOptimizationBusy(null)
+        }
+      },
+    })
+  }
+
+  const launchGame = async () => {
+    try {
+      await invoke('launch_cs2_game')
+      setHawkEyeVisible(false)
+      setEntryScreen(false)
+      notify('Launching Counter-Strike 2', 'Steam received a launch request for the verified CS2 installation.', 'success')
+    } catch (error) {
+      notify('Could not launch Counter-Strike 2', String(error), 'error')
+    }
+  }
+
+  const startHawkEyeScan = async () => {
+    setHawkEyeVisible(true)
+    setHawkEyeReport(null)
+    setHawkEyeError(null)
+    setHawkEyeProgress({ step: 'INITIALIZING SCAN', percent: 0 })
+    let unlisten: (() => void) | undefined
+    try {
+      unlisten = await listen<ScanProgress>('hawk-eye-progress', (event) => setHawkEyeProgress(event.payload))
+      const report = await invoke<ScanReport>('run_hawk_eye_scan')
+      setHawkEyeReport(report)
+      setHawkEyeProgress({ step: 'FINALIZING SCAN', percent: 100 })
+      recordActivity('Hawk Eye scan completed', `${report.goodCount} good · ${report.attentionCount} need attention · ${report.unsupportedCount} unsupported.`)
+      notify('Hawk Eye scan complete', 'Review local findings and public-resolver ping samples. No files or settings were changed.', 'success')
+    } catch (error) {
+      if (String(error).includes('SCAN_CANCELLED')) {
+        setHawkEyeVisible(false)
+        notify('Scan cancelled', 'No files or settings were changed.', 'info')
+      } else {
+        setHawkEyeVisible(false)
+        notify('Hawk Eye scan failed', String(error), 'error')
+      }
+    } finally {
+      unlisten?.()
+    }
+  }
+
+  const cancelHawkEyeScan = async () => {
+    try {
+      await invoke('cancel_hawk_eye_scan')
+    } catch (error) {
+      setHawkEyeError(`Could not cancel the scan: ${String(error)}`)
+    }
+  }
+
+  useEffect(() => {
+    let active = true
+    void (async () => {
+      const [savedSettings, savedDataPath] = await Promise.all([
+        invoke<DesktopSettings>('load_desktop_settings'),
+        invoke<string>('get_local_data_directory'),
+      ])
+      if (!active) return
+      setSettings(savedSettings)
+      setDataPath(savedDataPath)
+      setIntroEnabledOnBoot(savedSettings.introEnabled)
+      await Promise.all([refreshSnapshot(true), refreshConfig(), refreshStartup(), refreshTempScan(true), refreshPowerPlan()])
+      if (active) await detectGame()
+      if (active) {
+        if (savedSettings.introEnabled) {
+          window.setTimeout(() => { if (active) setBooting(false) }, savedSettings.reduceMotion ? 350 : 1450)
+        } else {
+          setBooting(false)
+        }
+      }
+    })().catch((error: unknown) => {
+      if (active) {
+        notify('CSRIFT could not load local settings', String(error), 'error')
+        setBooting(false)
+      }
+    })
+    return () => { active = false }
+  }, [detectGame, notify, refreshConfig, refreshPowerPlan, refreshSnapshot, refreshStartup, refreshTempScan])
 
   const runPing = async (target: string) => {
     const result = await invoke<PingResult>('run_ping_test', { target })
@@ -714,7 +1006,7 @@ function DesktopApp() {
 
   const renderPage = () => {
     switch (page) {
-      case 'dashboard': return <DashboardPage snapshot={snapshot} history={telemetryHistory} latestPing={latestPing} config={configStatus} onPage={setPage} />
+      case 'dashboard': return <DashboardPage snapshot={snapshot} history={telemetryHistory} latestPing={latestPing} config={configStatus} gameDetection={gameDetection} onPage={setPage} onGameDetection={() => setEntryScreen(true)} />
       case 'fps': return <FpsPage snapshot={snapshot} history={telemetryHistory} onRefresh={() => void refreshSnapshot()} loading={loadingSnapshot} />
       case 'network': return <NetworkPage latestPing={latestPing} pingHistory={pingHistory} onPing={runPing} />
       case 'monitor': return <MonitorPage snapshot={snapshot} history={telemetryHistory} monitoring={monitoring} onToggle={() => setMonitoring((value) => !value)} onRefresh={() => void refreshSnapshot()} loading={loadingSnapshot} />
@@ -729,14 +1021,15 @@ function DesktopApp() {
     <div className={`desktop-shell ${settings.accent === 'amber' ? 'accent-amber' : ''}`}>
       <div className="titlebar" data-tauri-drag-region>
         <div className="titlebar-brand" data-tauri-drag-region><span>C</span><b>CSRIFT</b><i /></div>
-        <div className="titlebar-center" data-tauri-drag-region><span>CONTROL CENTER</span><ChevronRight size={12} />{currentPage.title}</div>
+        <div className="titlebar-center" data-tauri-drag-region><span>{entryScreen ? 'GAME DETECTION' : 'CONTROL CENTER'}</span><ChevronRight size={12} />{entryScreen ? 'COUNTER-STRIKE 2' : currentPage.title}</div>
         <div className="titlebar-right"><span className="local-only-label"><i /> LOCAL SESSION</span><WindowControls /></div>
       </div>
 
-      <div className="app-layout">
+      {entryScreen ? <GameDetectionScreen detection={gameDetection} busy={detectionBusy} progress={detectionProgress} error={detectionError} onFind={detectGame} onPick={pickGameFolder} onContinue={() => setEntryScreen(false)} onScan={() => { void startHawkEyeScan() }} onOptimize={openOptimization} reduceMotion={motionDisabled} /> : <div className="app-layout">
         <aside className="sidebar">
           <div className="sidebar-brand"><span className="brand-symbol">C</span><span><b>CSRIFT</b><small>PRECISION / CONTROL</small></span><span className="brand-presence"><i /></span></div>
           <div className="sidebar-rule" />
+          <button className={`nav-item game-detection-nav ${entryScreen ? 'is-current' : ''}`} onClick={() => setEntryScreen(true)} aria-current={entryScreen ? 'page' : undefined}><Gamepad2 size={16} strokeWidth={1.7} /><span>Game Detection</span><small className="nav-recommended">RECOMMENDED</small>{entryScreen && <i className="nav-active-mark" />}</button>
           <nav className="sidebar-nav" aria-label="Application pages">{groups.map((group) => <div className="nav-group" key={group}><span className="nav-group-label">{group}</span>{navigation.filter((item) => item.group === group).map((item) => { const Icon = item.icon; return <button className={`nav-item ${page === item.id ? 'is-current' : ''}`} key={item.id} onClick={() => setPage(item.id)} aria-current={page === item.id ? 'page' : undefined}><Icon size={16} strokeWidth={1.7} /><span>{item.label}</span>{page === item.id && <i className="nav-active-mark" />}</button> })}</div>)}</nav>
           <div className="sidebar-bottom">
             <div className="sidebar-system"><span className="sidebar-section-label">SYSTEM STATUS</span><div className="sidebar-health"><i className={snapshot ? 'healthy' : 'pending'} /><span>{snapshot ? 'WINDOWS CONNECTED' : 'READING SYSTEM'}</span></div><div className="sidebar-mini-metrics"><span><Cpu size={12} /> CPU <b>{percent(snapshot?.cpuUsagePercent)}</b></span><span><Activity size={12} /> RAM <b>{percent(snapshot?.memoryUsagePercent)}</b></span></div></div>
@@ -747,7 +1040,7 @@ function DesktopApp() {
         <main className="main-panel">
           <header className="content-header">
             <div className="content-heading"><span className="eyebrow"><i />{currentPage.eyebrow}</span><h1>{currentPage.title}</h1><p>{currentPage.description}</p></div>
-            <div className="content-tools"><button className="tool-button" title="Refresh system data" onClick={() => void refreshSnapshot()} disabled={loadingSnapshot}><RefreshCw size={15} className={loadingSnapshot ? 'spin' : ''} /></button><span className="header-separator" /><button className="session-button" onClick={() => setPage('recovery')}><span className="session-icon"><ShieldCheck size={13} /></span><span><b>LOCAL & SAFE</b><small>{snapshot ? snapshot.osName ?? 'WINDOWS DESKTOP' : 'AWAITING SYSTEM'}</small></span></button></div>
+            <div className="content-tools"><button className="button button-primary optimize-header-button" onClick={openOptimization}><Zap size={13} /> OPTIMIZE FOR CS2</button><button className="tool-button" title="Refresh system data" onClick={() => void refreshSnapshot()} disabled={loadingSnapshot}><RefreshCw size={15} className={loadingSnapshot ? 'spin' : ''} /></button><span className="header-separator" /><button className="session-button" onClick={() => setPage('recovery')}><span className="session-icon"><ShieldCheck size={13} /></span><span><b>LOCAL & SAFE</b><small>{snapshot ? snapshot.osName ?? 'WINDOWS DESKTOP' : 'AWAITING SYSTEM'}</small></span></button></div>
           </header>
 
           <div className="content-scroll">
@@ -759,9 +1052,12 @@ function DesktopApp() {
             <footer className="main-footer"><span>CSRIFT / OFFLINE-CAPABLE BY DESIGN</span><span>NEVER INJECTS INTO THE GAME</span><span>0.1.0 PREVIEW</span></footer>
           </div>
         </main>
-      </div>
+      </div>}
 
       <AnimatePresence>{booting && introEnabledOnBoot && <BootIntro reduceMotion={motionDisabled} onSkip={() => setBooting(false)} />}</AnimatePresence>
+      <AnimatePresence>{hawkEyeVisible && <HawkEyeOverlay progress={hawkEyeProgress} report={hawkEyeReport} error={hawkEyeError} reduceMotion={motionDisabled} gameDetected={gameDetection?.detected === true} onCancel={() => { void cancelHawkEyeScan() }} onContinue={() => { setHawkEyeVisible(false); setEntryScreen(false) }} onLaunch={() => { void launchGame() }} onRetry={() => { void startHawkEyeScan() }} onOptimize={openOptimization} />}</AnimatePresence>
+
+      <AnimatePresence>{optimizationOpen && <Cs2OptimizationPanel status={optimizationStatus} loading={optimizationLoading} busy={optimizationBusy} error={optimizationError} onClose={() => setOptimizationOpen(false)} onApply={(setting) => confirmOptimizationChange(setting)} onRestore={(setting) => confirmOptimizationChange(setting, true)} />}</AnimatePresence>
 
       <AnimatePresence>{toasts.map((toast) => <motion.div key={toast.id} className={`toast toast-${toast.tone}`} initial={{ opacity: 0, y: 12, x: 8 }} animate={{ opacity: 1, y: 0, x: 0 }} exit={{ opacity: 0, y: 7, x: 8 }}><span className="toast-icon">{toast.tone === 'success' ? <CheckCircle2 size={16} /> : toast.tone === 'error' ? <CircleAlert size={16} /> : <Activity size={16} />}</span><span><b>{toast.title}</b><small>{toast.message}</small></span><button aria-label="Dismiss notification" onClick={() => dismiss(toast.id)}><X size={13} /></button></motion.div>)}</AnimatePresence>
 

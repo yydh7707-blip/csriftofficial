@@ -1,14 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    net::IpAddr,
+    net::{IpAddr, UdpSocket},
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use sysinfo::{Components, Disks, Networks, ProcessesToUpdate, System};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 fn unix_millis() -> u128 {
     SystemTime::now()
@@ -83,9 +87,8 @@ async fn get_system_snapshot() -> Result<SystemSnapshot, String> {
         };
         let memory_total_bytes = system.total_memory();
         let memory_used_bytes = system.used_memory();
-        let memory_usage_percent = (memory_total_bytes > 0).then(|| {
-            (memory_used_bytes as f64 / memory_total_bytes as f64 * 100.0) as f32
-        });
+        let memory_usage_percent = (memory_total_bytes > 0)
+            .then(|| (memory_used_bytes as f64 / memory_total_bytes as f64 * 100.0) as f32);
 
         let components = Components::new_with_refreshed_list();
         let cpu_temperature_c = components
@@ -134,7 +137,10 @@ async fn get_system_snapshot() -> Result<SystemSnapshot, String> {
             .cloned()
             .collect();
         let cs2_running = system.processes().values().any(|process| {
-            process.name().to_string_lossy().eq_ignore_ascii_case("cs2.exe")
+            process
+                .name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("cs2.exe")
         });
 
         Ok(SystemSnapshot {
@@ -265,10 +271,7 @@ fn list_startup_entries() -> Result<Vec<StartupEntry>, String> {
     {
         use winreg::{enums::*, RegKey};
         let mut entries = Vec::new();
-        let registry_roots = [
-            (HKEY_CURRENT_USER, "HKCU"),
-            (HKEY_LOCAL_MACHINE, "HKLM"),
-        ];
+        let registry_roots = [(HKEY_CURRENT_USER, "HKCU"), (HKEY_LOCAL_MACHINE, "HKLM")];
         let registry_path = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
         for (root, source) in registry_roots {
             let root_key = RegKey::predef(root);
@@ -345,7 +348,9 @@ fn get_active_power_plan() -> Result<PowerPlan, String> {
         let output = Command::new("powercfg.exe")
             .arg("/getactivescheme")
             .output()
-            .map_err(|error| format!("Could not inspect the current Windows power plan: {error}"))?;
+            .map_err(|error| {
+                format!("Could not inspect the current Windows power plan: {error}")
+            })?;
         if !output.status.success() {
             return Err(format!(
                 "Windows could not read the active power plan: {}",
@@ -355,7 +360,11 @@ fn get_active_power_plan() -> Result<PowerPlan, String> {
         let output = String::from_utf8_lossy(&output.stdout);
         let guid = output
             .split_whitespace()
-            .map(|token| token.trim_matches(|character: char| !character.is_ascii_hexdigit() && character != '-'))
+            .map(|token| {
+                token.trim_matches(|character: char| {
+                    !character.is_ascii_hexdigit() && character != '-'
+                })
+            })
             .find(|token| {
                 token.len() == 36
                     && token.chars().enumerate().all(|(index, character)| {
@@ -369,7 +378,11 @@ fn get_active_power_plan() -> Result<PowerPlan, String> {
             .map(str::to_string);
         let name = output
             .rsplit_once('(')
-            .and_then(|(_, suffix)| suffix.split_once(')').map(|(value, _)| value.trim().to_string()))
+            .and_then(|(_, suffix)| {
+                suffix
+                    .split_once(')')
+                    .map(|(value, _)| value.trim().to_string())
+            })
             .filter(|value| !value.is_empty());
         return Ok(PowerPlan {
             name,
@@ -380,6 +393,280 @@ fn get_active_power_plan() -> Result<PowerPlan, String> {
 
     #[cfg(not(target_os = "windows"))]
     Err("Windows power plans are supported only on Windows.".to_string())
+}
+
+const HIGH_PERFORMANCE_PLAN: &str = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
+const CS2_STEAM_APP_ID: &str = "730";
+const GAME_MODE_REGISTRY_KEY: &str = "Software\\Microsoft\\GameBar";
+const GAME_MODE_REGISTRY_VALUE: &str = "AutoGameModeEnabled";
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GameModeBackup {
+    was_present: bool,
+    value: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Cs2OptimizationState {
+    game_mode: Option<GameModeBackup>,
+    power_plan_guid: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Cs2OptimizationStatus {
+    game_mode_enabled: Option<bool>,
+    active_power_plan: PowerPlan,
+    high_performance_available: bool,
+    can_restore_game_mode: bool,
+    can_restore_power_plan: bool,
+}
+
+fn optimization_state_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|path| path.join("cs2-optimization-state.json"))
+        .map_err(|error| format!("Could not find the CSRIFT data folder: {error}"))
+}
+
+fn read_optimization_state(app: &AppHandle) -> Result<Cs2OptimizationState, String> {
+    let path = optimization_state_path(app)?;
+    if !path.is_file() {
+        return Ok(Cs2OptimizationState::default());
+    }
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("Could not read the saved optimization backup: {error}"))?;
+    serde_json::from_str(&content)
+        .map_err(|error| format!("The saved optimization backup is invalid: {error}"))
+}
+
+fn save_optimization_state(app: &AppHandle, state: &Cs2OptimizationState) -> Result<(), String> {
+    let content = serde_json::to_vec_pretty(state)
+        .map_err(|error| format!("Could not encode the optimization backup: {error}"))?;
+    data_dir(app)?;
+    fs::write(optimization_state_path(app)?, content)
+        .map_err(|error| format!("Could not save the optimization backup: {error}"))
+}
+
+#[cfg(target_os = "windows")]
+fn read_game_mode_value() -> Result<Option<u32>, String> {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    let user_key = RegKey::predef(HKEY_CURRENT_USER);
+    let key = match user_key.open_subkey(GAME_MODE_REGISTRY_KEY) {
+        Ok(key) => key,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Could not read the Windows Game Mode setting: {error}"
+            ))
+        }
+    };
+    match key.get_value::<u32, _>(GAME_MODE_REGISTRY_VALUE) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "Could not read the Windows Game Mode setting: {error}"
+        )),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn write_game_mode_value(value: Option<u32>) -> Result<(), String> {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
+        .create_subkey(GAME_MODE_REGISTRY_KEY)
+        .map_err(|error| format!("Could not access the current-user Game Mode setting: {error}"))?;
+    if let Some(value) = value {
+        key.set_value(GAME_MODE_REGISTRY_VALUE, &value)
+            .map_err(|error| format!("Could not enable Windows Game Mode: {error}"))
+    } else {
+        match key.delete_value(GAME_MODE_REGISTRY_VALUE) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "Could not restore the Windows Game Mode setting: {error}"
+            )),
+        }
+    }
+}
+
+fn high_performance_plan_available() -> Result<bool, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("powercfg.exe")
+            .arg("/list")
+            .output()
+            .map_err(|error| format!("Could not inspect Windows power plans: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Windows could not list power plans: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        return Ok(String::from_utf8_lossy(&output.stdout)
+            .to_ascii_lowercase()
+            .contains(HIGH_PERFORMANCE_PLAN));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    Err("Windows power plans are supported only on Windows.".to_string())
+}
+
+fn set_power_plan(guid: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("powercfg.exe")
+            .args(["/setactive", guid])
+            .output()
+            .map_err(|error| format!("Could not change the Windows power plan: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Windows could not change the power plan: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = guid;
+        Err("Windows power plans are supported only on Windows.".to_string())
+    }
+}
+
+#[tauri::command]
+fn get_cs2_optimization_status(app: AppHandle) -> Result<Cs2OptimizationStatus, String> {
+    let state = read_optimization_state(&app)?;
+    let game_mode_enabled = {
+        #[cfg(target_os = "windows")]
+        {
+            read_game_mode_value()?.map(|value| value != 0)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
+    };
+    Ok(Cs2OptimizationStatus {
+        game_mode_enabled,
+        active_power_plan: get_active_power_plan()?,
+        high_performance_available: high_performance_plan_available()?,
+        can_restore_game_mode: state.game_mode.is_some(),
+        can_restore_power_plan: state.power_plan_guid.is_some(),
+    })
+}
+
+#[tauri::command]
+fn apply_cs2_optimization(app: AppHandle, setting: String) -> Result<(), String> {
+    let mut state = read_optimization_state(&app)?;
+    match setting.as_str() {
+        "gameMode" => {
+            #[cfg(target_os = "windows")]
+            {
+                let current = read_game_mode_value()?;
+                if current == Some(1) {
+                    return Ok(());
+                }
+                let created_backup = state.game_mode.is_none();
+                if state.game_mode.is_none() {
+                    state.game_mode = Some(GameModeBackup {
+                        was_present: current.is_some(),
+                        value: current,
+                    });
+                    save_optimization_state(&app, &state)?;
+                }
+                if let Err(error) = write_game_mode_value(Some(1)) {
+                    if created_backup {
+                        state.game_mode = None;
+                        save_optimization_state(&app, &state)?;
+                    }
+                    return Err(error);
+                }
+                Ok(())
+            }
+            #[cfg(not(target_os = "windows"))]
+            Err("Windows Game Mode is supported only on Windows.".to_string())
+        }
+        "powerPlan" => {
+            let current = get_active_power_plan()?.guid.ok_or_else(|| {
+                "The current Windows power plan could not be identified.".to_string()
+            })?;
+            if current.eq_ignore_ascii_case(HIGH_PERFORMANCE_PLAN) {
+                return Ok(());
+            }
+            if !high_performance_plan_available()? {
+                return Err("The built-in High performance plan is not available on this PC. CSRIFT will not create or alter a power plan.".to_string());
+            }
+            let created_backup = state.power_plan_guid.is_none();
+            if state.power_plan_guid.is_none() {
+                state.power_plan_guid = Some(current);
+                save_optimization_state(&app, &state)?;
+            }
+            if let Err(error) = set_power_plan(HIGH_PERFORMANCE_PLAN) {
+                if created_backup {
+                    state.power_plan_guid = None;
+                    save_optimization_state(&app, &state)?;
+                }
+                return Err(error);
+            }
+            Ok(())
+        }
+        _ => Err("Choose a supported CS2 optimization setting.".to_string()),
+    }
+}
+
+#[tauri::command]
+fn restore_cs2_optimization(app: AppHandle, setting: String) -> Result<(), String> {
+    let mut state = read_optimization_state(&app)?;
+    match setting.as_str() {
+        "gameMode" => {
+            let backup = state
+                .game_mode
+                .clone()
+                .ok_or_else(|| "There is no saved Game Mode change to restore.".to_string())?;
+            #[cfg(target_os = "windows")]
+            {
+                let current = read_game_mode_value()?;
+                if current != Some(1) && current != backup.value {
+                    return Err("Windows Game Mode changed outside CSRIFT after optimization. Review it in Windows Settings; CSRIFT left the current value untouched.".to_string());
+                }
+                if current != backup.value {
+                    write_game_mode_value(if backup.was_present {
+                        backup.value
+                    } else {
+                        None
+                    })?;
+                }
+                state.game_mode = None;
+                save_optimization_state(&app, &state)
+            }
+            #[cfg(not(target_os = "windows"))]
+            Err("Windows Game Mode is supported only on Windows.".to_string())
+        }
+        "powerPlan" => {
+            let previous = state
+                .power_plan_guid
+                .clone()
+                .ok_or_else(|| "There is no saved power-plan change to restore.".to_string())?;
+            let current = get_active_power_plan()?.guid.ok_or_else(|| {
+                "The current Windows power plan could not be identified.".to_string()
+            })?;
+            if current.eq_ignore_ascii_case(&previous) {
+                state.power_plan_guid = None;
+                return save_optimization_state(&app, &state);
+            }
+            if !current.eq_ignore_ascii_case(HIGH_PERFORMANCE_PLAN) {
+                return Err("The active power plan changed outside CSRIFT after optimization. CSRIFT left the current plan untouched.".to_string());
+            }
+            set_power_plan(&previous)?;
+            state.power_plan_guid = None;
+            save_optimization_state(&app, &state)
+        }
+        _ => Err("Choose a supported CS2 optimization setting.".to_string()),
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -457,7 +744,9 @@ fn clean_temporary_files() -> Result<CleanupResult, String> {
         }
     }
     if result.removed_files == 0 && result.skipped_files > 0 {
-        return Err("No eligible temporary files could be removed; they may be in use.".to_string());
+        return Err(
+            "No eligible temporary files could be removed; they may be in use.".to_string(),
+        );
     }
     Ok(result)
 }
@@ -482,6 +771,892 @@ fn steam_directories() -> Vec<PathBuf> {
     candidates.sort();
     candidates.dedup();
     candidates
+}
+
+fn vdf_values(line: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut characters = line.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '"' {
+            continue;
+        }
+        let mut value = String::new();
+        while let Some(character) = characters.next() {
+            match character {
+                '\\' => {
+                    if let Some(escaped) = characters.next() {
+                        value.push(escaped);
+                    }
+                }
+                '"' => break,
+                value_character => value.push(value_character),
+            }
+        }
+        values.push(value);
+    }
+    values
+}
+
+fn parse_steam_library_paths(contents: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for line in contents.lines() {
+        let values = vdf_values(line);
+        if values.len() >= 2 && (values[0] == "path" || values[0].parse::<u32>().is_ok()) {
+            paths.push(PathBuf::from(&values[1]));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn steam_libraries(steam_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut libraries = Vec::new();
+    for steam_dir in steam_dirs {
+        libraries.push(steam_dir.clone());
+        let library_file = steam_dir.join("steamapps").join("libraryfolders.vdf");
+        let Ok(contents) = fs::read_to_string(library_file) else {
+            continue;
+        };
+        libraries.extend(parse_steam_library_paths(&contents));
+    }
+    libraries.retain(|path| path.is_dir());
+    libraries.sort();
+    libraries.dedup();
+    libraries
+}
+
+fn app_manifest_install_dir(library: &Path) -> Option<String> {
+    let manifest =
+        fs::read_to_string(library.join("steamapps").join("appmanifest_730.acf")).ok()?;
+    let mut app_id_matches = false;
+    let mut install_dir = None;
+    for line in manifest.lines() {
+        let values = vdf_values(line);
+        if values.len() >= 2 {
+            match values[0].as_str() {
+                "appid" => app_id_matches = values[1] == "730",
+                "installdir" => install_dir = Some(values[1].clone()),
+                _ => {}
+            }
+        }
+    }
+    app_id_matches.then_some(install_dir).flatten()
+}
+
+fn cs2_executable(path: &Path) -> Option<PathBuf> {
+    [
+        path.join("game").join("bin").join("win64").join("cs2.exe"),
+        path.join("bin").join("win64").join("cs2.exe"),
+        path.join("cs2.exe"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+}
+
+fn stored_game_path(app: &AppHandle) -> Option<PathBuf> {
+    let file = app.path().app_data_dir().ok()?.join("game-install.json");
+    let contents = fs::read_to_string(file).ok()?;
+    serde_json::from_str::<String>(&contents)
+        .ok()
+        .map(PathBuf::from)
+}
+
+fn save_game_path(app: &AppHandle, path: &Path) -> Result<(), String> {
+    let encoded = serde_json::to_vec_pretty(&path.to_string_lossy().to_string())
+        .map_err(|error| format!("Could not encode the CS2 installation path: {error}"))?;
+    fs::write(data_dir(app)?.join("game-install.json"), encoded)
+        .map_err(|error| format!("Could not save the CS2 installation path: {error}"))
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GameDetection {
+    detected: bool,
+    install_path: Option<String>,
+    steam_paths: Vec<String>,
+    library_paths: Vec<String>,
+    executable_found: bool,
+    config_files: Vec<String>,
+    launch_options_found: bool,
+    steam_running: bool,
+    source: Option<String>,
+}
+
+fn game_config_files() -> Vec<String> {
+    let Some(directory) = find_cs2_config_dir() else {
+        return Vec::new();
+    };
+    config_files(&directory)
+}
+
+fn has_cs2_launch_options(contents: &str) -> bool {
+    let mut in_app = false;
+    let mut app_depth = 0i32;
+    for line in contents.lines() {
+        let values = vdf_values(line);
+        if !in_app && values.first().is_some_and(|key| key == "730") {
+            in_app = true;
+        }
+        let has_options = in_app
+            && values.len() >= 2
+            && values[0] == "LaunchOptions"
+            && !values[1].trim().is_empty();
+        if in_app {
+            let previous_depth = app_depth;
+            app_depth += line.chars().filter(|character| *character == '{').count() as i32;
+            app_depth -= line.chars().filter(|character| *character == '}').count() as i32;
+            if app_depth < 0 || (previous_depth > 0 && app_depth == 0) {
+                in_app = false;
+                app_depth = 0;
+            }
+        }
+        if has_options {
+            return true;
+        }
+    }
+    false
+}
+
+fn launch_options_found(steam_dirs: &[PathBuf]) -> bool {
+    steam_dirs.iter().any(|steam_dir| {
+        let userdata = steam_dir.join("userdata");
+        let Ok(users) = fs::read_dir(userdata) else {
+            return false;
+        };
+        users.flatten().any(|user| {
+            fs::read_to_string(user.path().join("config").join("localconfig.vdf"))
+                .map(|contents| has_cs2_launch_options(&contents))
+                .unwrap_or(false)
+        })
+    })
+}
+
+fn steam_is_running() -> bool {
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    system.processes().values().any(|process| {
+        process
+            .name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("steam.exe")
+    })
+}
+
+fn detect_cs2(
+    app: &AppHandle,
+    manual_path: Option<String>,
+    show_progress: bool,
+) -> Result<GameDetection, String> {
+    if show_progress {
+        app.emit(
+            "game-detection-progress",
+            ScanProgress {
+                step: "SEARCHING FOR STEAM".to_string(),
+                percent: 10,
+            },
+        )
+        .map_err(|error| format!("Could not update game detection progress: {error}"))?;
+    }
+    let steam_dirs = steam_directories();
+    if show_progress {
+        app.emit(
+            "game-detection-progress",
+            ScanProgress {
+                step: "CHECKING GAME LIBRARIES".to_string(),
+                percent: 35,
+            },
+        )
+        .map_err(|error| format!("Could not update game detection progress: {error}"))?;
+    }
+    let libraries = steam_libraries(&steam_dirs);
+    if show_progress {
+        app.emit(
+            "game-detection-progress",
+            ScanProgress {
+                step: "LOCATING COUNTER-STRIKE 2".to_string(),
+                percent: 62,
+            },
+        )
+        .map_err(|error| format!("Could not update game detection progress: {error}"))?;
+    }
+    let manual_selection = manual_path.is_some();
+    let selected_path = if let Some(path) = manual_path {
+        Some((PathBuf::from(path), "MANUAL"))
+    } else {
+        stored_game_path(app).map(|path| (path, "SAVED"))
+    }
+    .filter(|(path, _)| path.is_dir());
+
+    let mut candidate = selected_path.map(|(path, source)| (path, source.to_string()));
+    if candidate.is_none() && !manual_selection {
+        for library in &libraries {
+            let Some(install_dir) = app_manifest_install_dir(library) else {
+                continue;
+            };
+            let path = library.join("steamapps").join("common").join(install_dir);
+            if path.is_dir() {
+                candidate = Some((path, "STEAM LIBRARY".to_string()));
+                break;
+            }
+        }
+    }
+
+    if show_progress {
+        app.emit(
+            "game-detection-progress",
+            ScanProgress {
+                step: "VERIFYING INSTALLATION".to_string(),
+                percent: 84,
+            },
+        )
+        .map_err(|error| format!("Could not update game detection progress: {error}"))?;
+    }
+    let installation = candidate.filter(|(path, _)| cs2_executable(path).is_some());
+    if show_progress {
+        if let Some((path, _)) = &installation {
+            save_game_path(app, path)?;
+        }
+    }
+    let config_files = game_config_files();
+    Ok(GameDetection {
+        detected: installation.is_some(),
+        install_path: installation
+            .as_ref()
+            .map(|(path, _)| path.to_string_lossy().into_owned()),
+        steam_paths: steam_dirs
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+        library_paths: libraries
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+        executable_found: installation
+            .as_ref()
+            .and_then(|(path, _)| cs2_executable(path))
+            .is_some(),
+        config_files,
+        launch_options_found: launch_options_found(&steam_dirs),
+        steam_running: steam_is_running(),
+        source: installation.as_ref().map(|(_, source)| source.clone()),
+    })
+}
+
+#[tauri::command]
+fn detect_cs2_installation(
+    app: AppHandle,
+    manual_path: Option<String>,
+) -> Result<GameDetection, String> {
+    let detection = detect_cs2(&app, manual_path, true)?;
+    app.emit(
+        "game-detection-progress",
+        ScanProgress {
+            step: "DETECTION COMPLETE".to_string(),
+            percent: 100,
+        },
+    )
+    .map_err(|error| format!("Could not finish game detection progress: {error}"))?;
+    Ok(detection)
+}
+
+#[tauri::command]
+fn launch_cs2_game(app: AppHandle) -> Result<(), String> {
+    let detection = detect_cs2(&app, None, false)?;
+    let install_path = detection.install_path.ok_or_else(|| {
+        "Counter-Strike 2 was not verified. Find the game installation before launching."
+            .to_string()
+    })?;
+    let install_path = PathBuf::from(install_path);
+    if cs2_executable(&install_path).is_none() {
+        return Err(
+            "The verified CS2 executable is no longer available. Run Game Detection again."
+                .to_string(),
+        );
+    }
+
+    let steam_executable = steam_directories()
+        .into_iter()
+        .map(|directory| directory.join("steam.exe"))
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            "Steam was not found. Install or repair Steam, then run Game Detection again."
+                .to_string()
+        })?;
+    let steam_directory = steam_executable
+        .parent()
+        .ok_or_else(|| "The Steam installation path is invalid.".to_string())?;
+    Command::new(&steam_executable)
+        .current_dir(steam_directory)
+        .args(["-applaunch", CS2_STEAM_APP_ID])
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Could not ask Steam to launch Counter-Strike 2: {error}"))
+}
+
+#[tauri::command]
+fn pick_cs2_installation_directory() -> Result<Option<String>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let script = "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; $dialog.Description = 'Select the Counter-Strike 2 installation folder'; $dialog.ShowNewFolderButton = $false; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Write($dialog.SelectedPath) }";
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-STA", "-Command", script])
+            .output()
+            .map_err(|error| format!("Could not open the folder picker: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "The folder picker failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Ok((!path.is_empty()).then_some(path));
+    }
+    #[cfg(not(target_os = "windows"))]
+    Err("The CS2 folder picker is only available on Windows.".to_string())
+}
+
+#[derive(Default)]
+struct ScanCancellation(Arc<AtomicBool>);
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanProgress {
+    step: String,
+    percent: u8,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanFinding {
+    label: String,
+    status: String,
+    detail: String,
+    recommendation: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanReport {
+    completed_at_ms: u128,
+    duration_ms: u128,
+    findings: Vec<ScanFinding>,
+    good_count: usize,
+    attention_count: usize,
+    unsupported_count: usize,
+}
+
+fn emit_scan_progress(app: &AppHandle, step: &str, percent: u8) -> Result<(), String> {
+    app.emit(
+        "hawk-eye-progress",
+        ScanProgress {
+            step: step.to_string(),
+            percent,
+        },
+    )
+    .map_err(|error| format!("Could not update scan progress: {error}"))
+}
+
+fn scan_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
+    if cancelled.load(Ordering::Relaxed) {
+        Err("SCAN_CANCELLED".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn finding(label: &str, status: &str, detail: String, recommendation: &str) -> ScanFinding {
+    ScanFinding {
+        label: label.to_string(),
+        status: status.to_string(),
+        detail,
+        recommendation: recommendation.to_string(),
+    }
+}
+
+fn active_network_route(ipv4: bool) -> Option<String> {
+    let address = if ipv4 {
+        "1.1.1.1:53"
+    } else {
+        "[2606:4700:4700::1111]:53"
+    };
+    let address = address.parse::<std::net::SocketAddr>().ok()?;
+    let socket = UdpSocket::bind(if ipv4 { "0.0.0.0:0" } else { "[::]:0" }).ok()?;
+    socket.connect(address).ok()?;
+    let local = socket.local_addr().ok()?.ip();
+    (!local.is_unspecified()).then(|| local.to_string())
+}
+
+fn ping_once(target: &str, ipv4: bool) -> Result<(bool, Option<f64>, String), String> {
+    let mut command = Command::new("ping.exe");
+    command.args(["-n", "1", "-w", "1200"]);
+    command.arg(if ipv4 { "-4" } else { "-6" });
+    let output = command
+        .arg(target)
+        .output()
+        .map_err(|error| format!("Could not start the Windows ping utility: {error}"))?;
+    if !output.status.success() && output.stdout.is_empty() {
+        return Err(format!(
+            "The Windows ping utility failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let response = String::from_utf8_lossy(&output.stdout);
+    let (replies, displayed, measured) = parse_ping_output(&response);
+    let detail = displayed
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "No reply (timeout or network policy)".to_string());
+    Ok((replies > 0, measured.first().copied(), detail))
+}
+
+fn wait_for_scan_interval(cancelled: &AtomicBool, duration: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        scan_cancelled(cancelled)?;
+        thread::sleep(
+            Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+    scan_cancelled(cancelled)
+}
+
+fn latest_backup_readonly(app: &AppHandle) -> Result<Option<(ConfigBackup, PathBuf)>, String> {
+    let root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Could not find the CSRIFT data folder: {error}"))?
+        .join("backups");
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    let mut backups = Vec::new();
+    for entry in fs::read_dir(root)
+        .map_err(|error| format!("Could not inspect local CS2 backups: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("Could not inspect a local backup: {error}"))?;
+        if !entry
+            .file_type()
+            .map_err(|error| format!("Could not inspect a local backup: {error}"))?
+            .is_dir()
+        {
+            continue;
+        }
+        let backup_dir = entry.path();
+        let manifest = backup_dir.join("manifest.json");
+        if !manifest.is_file() {
+            continue;
+        }
+        let content = fs::read_to_string(&manifest)
+            .map_err(|error| format!("Could not read a local backup manifest: {error}"))?;
+        let backup: ConfigBackup = serde_json::from_str(&content)
+            .map_err(|error| format!("A local backup manifest is invalid: {error}"))?;
+        backups.push((backup, backup_dir));
+    }
+    backups.sort_by(|left, right| right.0.created_at_ms.cmp(&left.0.created_at_ms));
+    Ok(backups.into_iter().next())
+}
+
+#[cfg(target_os = "windows")]
+fn gpu_device_names() -> Vec<String> {
+    use winreg::{enums::HKEY_LOCAL_MACHINE, RegKey};
+    let path = "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}";
+    let Ok(class_key) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(path) else {
+        return Vec::new();
+    };
+    let mut names = class_key
+        .enum_keys()
+        .flatten()
+        .filter_map(|subkey| class_key.open_subkey(subkey).ok())
+        .filter_map(|key| key.get_value::<String, _>("DriverDesc").ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+#[cfg(not(target_os = "windows"))]
+fn gpu_device_names() -> Vec<String> {
+    Vec::new()
+}
+
+#[tauri::command]
+async fn run_hawk_eye_scan(
+    app: AppHandle,
+    cancellation: State<'_, ScanCancellation>,
+) -> Result<ScanReport, String> {
+    let cancelled = cancellation.0.clone();
+    cancelled.store(false, Ordering::Relaxed);
+    tauri::async_runtime::spawn_blocking(move || {
+        let scan_started = Instant::now();
+        let mut findings = Vec::new();
+        scan_cancelled(&cancelled)?;
+        emit_scan_progress(&app, "INITIALIZING SCAN", 3)?;
+        let steam_running = steam_is_running();
+
+        scan_cancelled(&cancelled)?;
+        emit_scan_progress(&app, "ANALYZING GAME FILES", 12)?;
+        let detection = detect_cs2(&app, None, false)?;
+        findings.push(finding(
+            "CS2 INSTALLATION",
+            if detection.detected { "GOOD" } else { "NEEDS ATTENTION" },
+            detection.install_path.clone().unwrap_or_else(|| "No verified CS2 executable was found in the Steam libraries.".to_string()),
+            if detection.detected { "Installation path and executable were verified locally." } else { "Install CS2 through Steam or choose its verified installation folder." },
+        ));
+        findings.push(finding(
+            "STEAM CLIENT",
+            if steam_running { "GOOD" } else { "NEEDS ATTENTION" },
+            if steam_running { "Steam is currently running." } else { "Steam is not currently running." }.to_string(),
+            "Open Steam before launching CS2. No running game process is inspected or modified.",
+        ));
+        let steam_dirs = steam_directories();
+        let options_found = launch_options_found(&steam_dirs);
+        findings.push(finding(
+            "CS2 LAUNCH OPTIONS",
+            "GOOD",
+            if options_found { "A non-empty launch option entry was found for CS2 in a local Steam profile.".to_string() } else { "No custom CS2 launch options were found; Steam defaults may apply.".to_string() },
+            "Launch options are user-specific. Review them in Steam; CSRIFT does not add or remove options.",
+        ));
+
+        scan_cancelled(&cancelled)?;
+        emit_scan_progress(&app, "CHECKING CONFIGURATION", 25)?;
+        let config_dir = find_cs2_config_dir();
+        let accessible_files = config_dir.as_ref().map(|directory| config_files(directory)).unwrap_or_default();
+        let config_available = config_dir.as_ref().is_some_and(|directory| fs::read_dir(directory).is_ok());
+        let mut config_bytes = 0u64;
+        let mut unreadable_files = Vec::new();
+        if let Some(directory) = config_dir.as_ref().filter(|_| config_available) {
+            for name in &accessible_files {
+                scan_cancelled(&cancelled)?;
+                match fs::read(directory.join(name)) {
+                    Ok(contents) => config_bytes = config_bytes.saturating_add(contents.len() as u64),
+                    Err(error) => unreadable_files.push(format!("{name}: {error}")),
+                }
+            }
+        }
+        findings.push(finding(
+            "CS2 CONFIGURATION",
+            if !config_available { "NOT SUPPORTED" } else if accessible_files.is_empty() || !unreadable_files.is_empty() { "NEEDS ATTENTION" } else { "GOOD" },
+            if !config_available {
+                "No readable Steam userdata / 730 / local / cfg folder was found.".to_string()
+            } else if !unreadable_files.is_empty() {
+                format!("{} supported file(s), {} bytes read. Could not read: {}", accessible_files.len(), config_bytes, unreadable_files.join("; "))
+            } else {
+                format!("{} supported .cfg / .vcfg file(s), {} bytes read from disk.", accessible_files.len(), config_bytes)
+            },
+            "Create a local CSRIFT backup before changing supported configuration files.",
+        ));
+        scan_cancelled(&cancelled)?;
+        let latest_backup = latest_backup_readonly(&app)?;
+        let backup_comparison = if let (Some(directory), Some((backup, backup_dir))) =
+            (config_dir.as_ref().filter(|_| config_available), latest_backup.as_ref())
+        {
+            let mut changed_files = Vec::new();
+            let mut unavailable_files = Vec::new();
+            for name in &backup.files {
+                if !accessible_files.contains(name) {
+                    changed_files.push(name.clone());
+                }
+            }
+            for name in &accessible_files {
+                scan_cancelled(&cancelled)?;
+                match (
+                    fs::read(directory.join(name)),
+                    fs::read(backup_dir.join(name)),
+                ) {
+                    (Ok(current), Ok(saved)) if current != saved => changed_files.push(name.clone()),
+                    (Ok(_), Ok(_)) => {}
+                    (_, Err(error)) => unavailable_files.push(format!("{name}: saved copy {error}")),
+                    (Err(error), _) => unavailable_files.push(format!("{name}: current file {error}")),
+                }
+            }
+            Some((backup.id.clone(), changed_files, unavailable_files))
+        } else {
+            None
+        };
+        let backup_available = backup_comparison.is_some();
+        let backup_detail = match backup_comparison {
+            Some((id, changed, unreadable)) if unreadable.is_empty() && changed.is_empty() => {
+                format!("All readable CS2 settings match local backup {id}.")
+            }
+            Some((id, changed, unreadable)) if unreadable.is_empty() => {
+                format!("Compared with local backup {id}; {} file(s) differ: {}.", changed.len(), changed.join(", "))
+            }
+            Some((id, changed, unreadable)) => format!(
+                "Compared with local backup {id}; {} file(s) differ, and {} comparison(s) were unavailable: {}.",
+                changed.len(),
+                unreadable.len(),
+                unreadable.join("; ")
+            ),
+            None if config_available => "No existing CSRIFT backup was found. The scan did not create one.".to_string(),
+            None => "A local CS2 settings directory is required before CSRIFT can verify a backup.".to_string(),
+        };
+        findings.push(finding(
+            "BACKUP READINESS",
+            if !config_available { "NOT SUPPORTED" } else if backup_available { "GOOD" } else { "NEEDS ATTENTION" },
+            backup_detail,
+            "Create a backup separately; scanning never writes files or tests write access.",
+        ));
+
+        scan_cancelled(&cancelled)?;
+        emit_scan_progress(&app, "ANALYZING SYSTEM ENVIRONMENT", 43)?;
+        let mut system = System::new_all();
+        system.refresh_cpu_all();
+        thread::sleep(Duration::from_millis(220));
+        system.refresh_cpu_all();
+        system.refresh_memory();
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        let cpu = system.cpus().first().map(|cpu| cpu.brand().trim().to_string()).unwrap_or_default();
+        let memory_total = system.total_memory();
+        let memory_used = system.used_memory();
+        let cpu_usage = if system.cpus().is_empty() {
+            "load unavailable".to_string()
+        } else {
+            format!(
+                "{:.0}% average load",
+                system.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>()
+                    / system.cpus().len() as f32
+            )
+        };
+        findings.push(finding(
+            "CPU & MEMORY",
+            if !cpu.is_empty() && memory_total > 0 { "GOOD" } else { "NOT SUPPORTED" },
+            format!("CPU: {} ({}) · Memory in use: {:.1} / {:.1} GB", if cpu.is_empty() { "not reported" } else { &cpu }, cpu_usage, memory_used as f64 / 1_073_741_824.0, memory_total as f64 / 1_073_741_824.0),
+            "Values are read from Windows; CSRIFT does not estimate missing sensor data.",
+        ));
+        findings.push(finding(
+            "CS2 PROCESS",
+            "GOOD",
+            if system.processes().values().any(|process| process.name().to_string_lossy().eq_ignore_ascii_case("cs2.exe")) {
+                "The CS2 process is currently running (process presence only).".to_string()
+            } else {
+                "CS2 is not currently running. No game-process data was accessed.".to_string()
+            },
+            "CSRIFT does not inspect game memory or interact with the running game.",
+        ));
+        let components = Components::new_with_refreshed_list();
+        let gpu_temperature = components.iter().any(|component| {
+            let label = component.label().to_ascii_lowercase();
+            (label.contains("gpu") || label.contains("graphics")) && component.temperature().is_some()
+        });
+        let gpu_names = gpu_device_names();
+        findings.push(finding(
+            "GPU DEVICE",
+            if gpu_names.is_empty() { "NOT SUPPORTED" } else { "GOOD" },
+            if gpu_names.is_empty() {
+                "Windows did not expose a graphics adapter name through its display-driver registry.".to_string()
+            } else {
+                format!("{} · telemetry: {}", gpu_names.join(", "), if gpu_temperature { "graphics temperature sensor available" } else { "usage / temperature sensors unavailable" })
+            },
+            "Use the GPU vendor's trusted monitoring software for telemetry not exposed to CSRIFT.",
+        ));
+        let disks = Disks::new_with_refreshed_list();
+        let disk_summary = disks
+            .iter()
+            .map(|disk| {
+                let total = disk.total_space();
+                let available = disk.available_space();
+                format!(
+                    "{}: {:.1} GB free / {:.1} GB",
+                    disk.mount_point().display(),
+                    available as f64 / 1_073_741_824.0,
+                    total as f64 / 1_073_741_824.0
+                )
+            })
+            .collect::<Vec<_>>();
+        findings.push(finding(
+            "DISK CAPACITY",
+            if disk_summary.is_empty() { "NOT SUPPORTED" } else { "GOOD" },
+            if disk_summary.is_empty() { "Windows did not report mounted disk capacity.".to_string() } else { disk_summary.join(" · ") },
+            "Capacity is informational; CSRIFT does not delete files during a scan.",
+        ));
+
+        scan_cancelled(&cancelled)?;
+        emit_scan_progress(&app, "CHECKING NETWORK STATUS", 61)?;
+        let networks = Networks::new_with_refreshed_list();
+        let route_v4 = active_network_route(true);
+        let route_v6 = active_network_route(false);
+        findings.push(finding(
+            "NETWORK ADAPTERS",
+            if networks.is_empty() { "NOT SUPPORTED" } else { "GOOD" },
+            if networks.is_empty() { "Windows did not report network interfaces.".to_string() } else { format!("{} interface(s): {}", networks.len(), networks.keys().cloned().collect::<Vec<_>>().join(", ")) },
+            "Adapter presence alone does not guarantee a route to the internet or a CS2 server.",
+        ));
+        findings.push(finding(
+            "IPV4 ROUTE",
+            if route_v4.is_some() { "GOOD" } else { "NEEDS ATTENTION" },
+            route_v4.clone().map(|address| format!("Windows selected local IPv4 address {address} for an internet route."))
+                .unwrap_or_else(|| "No active IPv4 route to the diagnostic target was found.".to_string()),
+            "The following ping samples use Cloudflare DNS as a public comparison endpoint, not a CS2 server.",
+        ));
+        findings.push(finding(
+            "IPV6 ROUTE",
+            if route_v6.is_some() { "GOOD" } else { "NOT SUPPORTED" },
+            route_v6.clone().map(|address| format!("Windows selected local IPv6 address {address} for an internet route."))
+                .unwrap_or_else(|| "No IPv6 route to the diagnostic target was detected; IPv4 remains tested separately.".to_string()),
+            "IPv6 availability depends on your network provider and local configuration.",
+        ));
+        if route_v4.is_some() {
+            let mut received = 0u32;
+            let mut latencies = Vec::new();
+            let mut samples = Vec::new();
+            for index in 0..4 {
+                scan_cancelled(&cancelled)?;
+                let (replied, latency, display) = ping_once("1.1.1.1", true)?;
+                received += u32::from(replied);
+                if let Some(latency) = latency {
+                    latencies.push(latency);
+                }
+                samples.push(display);
+                emit_scan_progress(&app, "CHECKING NETWORK STATUS", 63 + (index as u8 * 4))?;
+                if index < 3 {
+                    wait_for_scan_interval(&cancelled, Duration::from_millis(800))?;
+                }
+            }
+            let average = if latencies.is_empty() {
+                "not measurable (<1 ms replies or no numeric samples)".to_string()
+            } else {
+                format!("{:.1} ms average", latencies.iter().sum::<f64>() / latencies.len() as f64)
+            };
+            let loss = (4 - received) as f32 * 25.0;
+            findings.push(finding(
+                "IPV4 PING · 1.1.1.1",
+                if received == 4 { "GOOD" } else { "NEEDS ATTENTION" },
+                format!("4 packets sent · {received} received · {loss:.0}% loss · {average} · samples: {}", samples.join(", ")),
+                "This is a live public-resolver sample, not a measurement of your CS2 match server or a promise of lower game latency.",
+            ));
+        } else {
+            findings.push(finding(
+                "IPV4 PING · 1.1.1.1",
+                "NOT SUPPORTED",
+                "No IPv4 route was detected, so ping packets were not sent.".to_string(),
+                "Check your network connection; a game-server route may differ.",
+            ));
+        }
+        if route_v6.is_some() {
+            let mut received = 0u32;
+            let mut latencies = Vec::new();
+            let mut samples = Vec::new();
+            for index in 0..4 {
+                scan_cancelled(&cancelled)?;
+                let (replied, latency, display) = ping_once("2606:4700:4700::1111", false)?;
+                received += u32::from(replied);
+                if let Some(latency) = latency {
+                    latencies.push(latency);
+                }
+                samples.push(display);
+                emit_scan_progress(&app, "CHECKING NETWORK STATUS", 81 + (index as u8 * 3))?;
+                if index < 3 {
+                    wait_for_scan_interval(&cancelled, Duration::from_millis(800))?;
+                }
+            }
+            let average = if latencies.is_empty() {
+                "not measurable (<1 ms replies or no numeric samples)".to_string()
+            } else {
+                format!("{:.1} ms average", latencies.iter().sum::<f64>() / latencies.len() as f64)
+            };
+            let loss = (4 - received) as f32 * 25.0;
+            findings.push(finding(
+                "IPV6 PING · CLOUDFLARE",
+                if received == 4 { "GOOD" } else { "NEEDS ATTENTION" },
+                format!("4 packets sent · {received} received · {loss:.0}% loss · {average} · samples: {}", samples.join(", ")),
+                "This public endpoint is only a comparison sample; it does not represent your CS2 match server.",
+            ));
+        } else {
+            findings.push(finding(
+                "IPV6 PING · CLOUDFLARE",
+                "NOT SUPPORTED",
+                "No IPv6 route was detected, so IPv6 ping packets were not sent.".to_string(),
+                "IPv6 support depends on your network; this does not prevent the separate IPv4 test.",
+            ));
+        }
+        match list_dns_servers() {
+            Ok(servers) if !servers.is_empty() => findings.push(finding(
+                "DNS SERVERS",
+                "GOOD",
+                format!("{} configured server(s): {}", servers.len(), servers.iter().map(|server| server.address.as_str()).collect::<Vec<_>>().join(", ")),
+                "DNS selection does not guarantee lower CS2 ping; CSRIFT does not change resolver settings.",
+            )),
+            Ok(_) => findings.push(finding(
+                "DNS SERVERS",
+                "NEEDS ATTENTION",
+                "Windows reported no configured DNS server addresses.".to_string(),
+                "Review DNS configuration in Windows Settings or with your network administrator.",
+            )),
+            Err(error) => findings.push(finding(
+                "DNS SERVERS",
+                "NOT SUPPORTED",
+                format!("DNS settings could not be read: {error}"),
+                "CSRIFT leaves DNS settings unchanged.",
+            )),
+        }
+        #[cfg(target_os = "windows")]
+        let game_mode = read_game_mode_value();
+        #[cfg(not(target_os = "windows"))]
+        let game_mode: Result<Option<u32>, String> =
+            Err("Windows Game Mode is supported only on Windows.".to_string());
+        match game_mode {
+            Ok(Some(1)) => findings.push(finding(
+                "WINDOWS GAME MODE",
+                "GOOD",
+                "Windows reports Game Mode enabled.".to_string(),
+                "CSRIFT can restore a prior value if it changes this setting after your confirmation.",
+            )),
+            Ok(Some(_)) => findings.push(finding(
+                "WINDOWS GAME MODE",
+                "NEEDS ATTENTION",
+                "Windows reports Game Mode disabled.".to_string(),
+                "CSRIFT can enable this current-user setting after your confirmation and save its previous value for restore.",
+            )),
+            Ok(None) => findings.push(finding(
+                "WINDOWS GAME MODE",
+                "NOT SUPPORTED",
+                "Windows did not report an explicit Game Mode value for the current user.".to_string(),
+                "CSRIFT can create the current-user setting after your confirmation and remove its value if you restore.",
+            )),
+            Err(error) => findings.push(finding(
+                "WINDOWS GAME MODE",
+                "NOT SUPPORTED",
+                format!("Game Mode could not be read: {error}"),
+                "CSRIFT leaves the setting unchanged when Windows does not allow it to be read.",
+            )),
+        }
+        match get_active_power_plan() {
+            Ok(plan) => findings.push(finding(
+                "WINDOWS POWER PLAN",
+                if plan.available { "GOOD" } else { "NOT SUPPORTED" },
+                format!("{} · {}", plan.name.unwrap_or_else(|| "Plan name unavailable".to_string()), plan.guid.unwrap_or_else(|| "GUID unavailable".to_string())),
+                "A High performance plan is optional, may use more power, and is never enabled without your confirmation.",
+            )),
+            Err(error) => findings.push(finding(
+                "WINDOWS POWER PLAN",
+                "NOT SUPPORTED",
+                format!("The active power plan could not be read: {error}"),
+                "CSRIFT leaves power settings unchanged when Windows cannot report them.",
+            )),
+        }
+
+        scan_cancelled(&cancelled)?;
+        emit_scan_progress(&app, "FINALIZING SCAN", 96)?;
+        wait_for_scan_interval(
+            &cancelled,
+            Duration::from_secs(5).saturating_sub(scan_started.elapsed()),
+        )?;
+        let good_count = findings.iter().filter(|item| item.status == "GOOD").count();
+        let attention_count = findings.iter().filter(|item| item.status == "NEEDS ATTENTION").count();
+        let unsupported_count = findings.iter().filter(|item| item.status == "NOT SUPPORTED").count();
+        emit_scan_progress(&app, "FINALIZING SCAN", 100)?;
+        Ok(ScanReport { completed_at_ms: unix_millis(), duration_ms: scan_started.elapsed().as_millis(), findings, good_count, attention_count, unsupported_count })
+    })
+    .await
+    .map_err(|error| format!("Hawk Eye scan failed: {error}"))?
+}
+
+#[tauri::command]
+fn cancel_hawk_eye_scan(cancellation: State<'_, ScanCancellation>) {
+    cancellation.0.store(true, Ordering::Relaxed);
 }
 
 fn find_cs2_config_dir() -> Option<PathBuf> {
@@ -602,8 +1777,8 @@ fn backup_root(app: &AppHandle) -> Result<PathBuf, String> {
 fn saved_backups(app: &AppHandle) -> Result<Vec<ConfigBackup>, String> {
     let root = backup_root(app)?;
     let mut result = Vec::new();
-    for entry in fs::read_dir(root)
-        .map_err(|error| format!("Could not read local backups: {error}"))?
+    for entry in
+        fs::read_dir(root).map_err(|error| format!("Could not read local backups: {error}"))?
     {
         let entry = entry.map_err(|error| format!("Could not inspect a backup: {error}"))?;
         if !entry
@@ -634,7 +1809,9 @@ fn create_config_backup(app: AppHandle) -> Result<ConfigBackup, String> {
     })?;
     let files = config_files(&config_dir);
     if files.is_empty() {
-        return Err("The detected CS2 folder has no supported .cfg or .vcfg files to back up.".to_string());
+        return Err(
+            "The detected CS2 folder has no supported .cfg or .vcfg files to back up.".to_string(),
+        );
     }
     let root = backup_root(&app)?;
     let id = unix_millis().to_string();
@@ -669,7 +1846,11 @@ fn list_config_backups(app: AppHandle) -> Result<Vec<ConfigBackup>, String> {
 
 #[tauri::command]
 fn restore_config_backup(app: AppHandle, backup_id: String) -> Result<ConfigBackup, String> {
-    if backup_id.is_empty() || !backup_id.chars().all(|character| character.is_ascii_digit()) {
+    if backup_id.is_empty()
+        || !backup_id
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
         return Err("The selected backup ID is invalid.".to_string());
     }
     let backup = saved_backups(&app)?
@@ -690,7 +1871,9 @@ fn restore_config_backup(app: AppHandle, backup_id: String) -> Result<ConfigBack
         if !["cfg", "vcfg"].contains(&extension.as_str())
             || Path::new(name).file_name().and_then(|value| value.to_str()) != Some(name)
         {
-            return Err("A backup contains an unsupported file name; restore was cancelled.".to_string());
+            return Err(
+                "A backup contains an unsupported file name; restore was cancelled.".to_string(),
+            );
         }
         let source = stored.join(name);
         if !source.is_file() {
@@ -700,8 +1883,12 @@ fn restore_config_backup(app: AppHandle, backup_id: String) -> Result<ConfigBack
 
     let safety = create_config_backup(app.clone())?;
     for name in &backup.files {
-        fs::copy(stored.join(name), live_config.join(name))
-            .map_err(|error| format!("Could not restore {name}; safety backup {} was created: {error}", safety.id))?;
+        fs::copy(stored.join(name), live_config.join(name)).map_err(|error| {
+            format!(
+                "Could not restore {name}; safety backup {} was created: {error}",
+                safety.id
+            )
+        })?;
     }
     Ok(safety)
 }
@@ -745,8 +1932,7 @@ fn load_desktop_settings(app: AppHandle) -> Result<DesktopSettings, String> {
     }
     let content = fs::read_to_string(&file)
         .map_err(|error| format!("Could not read CSRIFT settings: {error}"))?;
-    serde_json::from_str(&content)
-        .map_err(|error| format!("CSRIFT settings are invalid: {error}"))
+    serde_json::from_str(&content).map_err(|error| format!("CSRIFT settings are invalid: {error}"))
 }
 
 #[tauri::command]
@@ -774,11 +1960,14 @@ fn validate_profile_name(name: &str) -> Result<String, String> {
     let name = name.trim();
     if name.is_empty()
         || name.chars().count() > 32
-        || !name
-            .chars()
-            .all(|character| character.is_alphanumeric() || character == ' ' || character == '-' || character == '_')
+        || !name.chars().all(|character| {
+            character.is_alphanumeric() || character == ' ' || character == '-' || character == '_'
+        })
     {
-        return Err("Use a profile name with up to 32 letters, numbers, spaces, hyphens, or underscores.".to_string());
+        return Err(
+            "Use a profile name with up to 32 letters, numbers, spaces, hyphens, or underscores."
+                .to_string(),
+        );
     }
     Ok(name.to_string())
 }
@@ -831,8 +2020,11 @@ fn create_config_profile(
     };
     let content = serde_json::to_vec_pretty(&profile)
         .map_err(|error| format!("Could not encode the profile: {error}"))?;
-    fs::write(profiles_dir(&app)?.join(format!("{}.json", profile.id)), content)
-        .map_err(|error| format!("Could not save the profile: {error}"))?;
+    fs::write(
+        profiles_dir(&app)?.join(format!("{}.json", profile.id)),
+        content,
+    )
+    .map_err(|error| format!("Could not save the profile: {error}"))?;
     Ok(profile)
 }
 
@@ -842,7 +2034,11 @@ fn rename_config_profile(
     profile_id: String,
     name: String,
 ) -> Result<ConfigProfile, String> {
-    if profile_id.is_empty() || !profile_id.chars().all(|character| character.is_ascii_digit()) {
+    if profile_id.is_empty()
+        || !profile_id
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
         return Err("The selected profile ID is invalid.".to_string());
     }
     let path = profiles_dir(&app)?.join(format!("{profile_id}.json"));
@@ -860,7 +2056,11 @@ fn rename_config_profile(
 
 #[tauri::command]
 fn delete_config_profile(app: AppHandle, profile_id: String) -> Result<(), String> {
-    if profile_id.is_empty() || !profile_id.chars().all(|character| character.is_ascii_digit()) {
+    if profile_id.is_empty()
+        || !profile_id
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
         return Err("The selected profile ID is invalid.".to_string());
     }
     let file = profiles_dir(&app)?.join(format!("{profile_id}.json"));
@@ -888,12 +2088,21 @@ fn open_local_data_folder(app: AppHandle) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(ScanCancellation::default())
         .invoke_handler(tauri::generate_handler![
             get_system_snapshot,
+            detect_cs2_installation,
+            launch_cs2_game,
+            pick_cs2_installation_directory,
+            run_hawk_eye_scan,
+            cancel_hawk_eye_scan,
             run_ping_test,
             list_startup_entries,
             list_dns_servers,
             get_active_power_plan,
+            get_cs2_optimization_status,
+            apply_cs2_optimization,
+            restore_cs2_optimization,
             scan_temporary_files,
             clean_temporary_files,
             get_cs2_config_status,
@@ -912,4 +2121,60 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("CSRIFT desktop application failed to start");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        has_cs2_launch_options, parse_ping_output, parse_steam_library_paths, vdf_values,
+        CS2_STEAM_APP_ID,
+    };
+
+    #[test]
+    fn cs2_launch_uses_the_steam_app_id() {
+        assert_eq!(CS2_STEAM_APP_ID, "730");
+    }
+
+    #[test]
+    fn parses_ping_reply_and_sub_millisecond_samples() {
+        let output = "Reply from 1.1.1.1: bytes=32 time=24ms TTL=57\nReply from 1.1.1.1: bytes=32 time<1ms TTL=57";
+        let (replies, displayed, measured) = parse_ping_output(output);
+        assert_eq!(replies, 2);
+        assert_eq!(displayed, vec!["24 ms", "<1 ms"]);
+        assert_eq!(measured, vec![24.0]);
+    }
+
+    #[test]
+    fn ignores_ping_timeouts_when_counting_replies() {
+        let output = "Request timed out.\nRequest timed out.";
+        let (replies, displayed, measured) = parse_ping_output(output);
+        assert_eq!(replies, 0);
+        assert!(displayed.is_empty());
+        assert!(measured.is_empty());
+    }
+
+    #[test]
+    fn reads_escaped_steam_library_paths() {
+        let contents = "\"libraryfolders\"\n{\n  \"0\"\n  {\n    \"path\" \"C:\\\\Program Files (x86)\\\\Steam\"\n  }\n  \"1\" \"D:\\\\SteamLibrary\"\n}";
+        let paths = parse_steam_library_paths(contents);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].to_string_lossy(), r"C:\Program Files (x86)\Steam");
+        assert_eq!(paths[1].to_string_lossy(), r"D:\SteamLibrary");
+    }
+
+    #[test]
+    fn parses_quoted_vdf_values_with_escaped_backslashes() {
+        assert_eq!(
+            vdf_values("\"path\" \"E:\\\\Games\\\\Steam\""),
+            vec!["path", r"E:\Games\Steam"]
+        );
+    }
+
+    #[test]
+    fn only_reads_launch_options_from_the_cs2_app_section() {
+        let cs2_options = "\"apps\"\n{\n  \"730\"\n  {\n    \"LaunchOptions\" \"-novid\"\n  }\n  \"440\"\n  {\n    \"LaunchOptions\" \"-dxlevel 90\"\n  }\n}";
+        let other_game_options = "\"apps\"\n{\n  \"730\"\n  {\n    \"LaunchOptions\" \"\"\n  }\n  \"440\"\n  {\n    \"LaunchOptions\" \"-dxlevel 90\"\n  }\n}";
+        assert!(has_cs2_launch_options(cs2_options));
+        assert!(!has_cs2_launch_options(other_game_options));
+    }
 }

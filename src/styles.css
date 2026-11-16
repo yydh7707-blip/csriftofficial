@@ -207,8 +207,9 @@ a:hover .arrow-icon, button:hover .arrow-icon { transform: translate(2px, -1px);
 .download-content { width: min(1160px, calc(100% - 96px)); margin: 0 auto; padding: 75px 0; }
 .download-section h2 { margin-top: 24px; font-size: clamp(57px, 7.3vw, 88px); }
 .download-content > p { margin: 18px 0 24px; color: #aaa49c; font-size: 13px; }
-.button-disabled { min-width: 221px; justify-content: space-between; border-color: rgba(255,255,255,.17); background: rgba(255,255,255,.035); color: #827e78; cursor: not-allowed; }
-.coming-soon { padding: 5px 6px; border: 1px solid rgba(243,106,29,.38); color: #e59a5b; font-size: 6px; }
+.download-button { min-width: 260px; justify-content: space-between; }
+.download-button > span { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+.download-button small { font-size: 7px; font-weight: 600; letter-spacing: .1em; opacity: .72; }
 .download-note { display: block; max-width: 370px; margin-top: 12px; color: #77736d; font-size: 9px; line-height: 1.7; }
 .download-corner { position: absolute; right: 48px; bottom: 32px; color: #716b63; font-size: 8px; letter-spacing: .15em; }
 
