@@ -6,15 +6,24 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "desktop:dev": "tauri dev --config desktop/src-tauri/tauri.conf.json",
+    "desktop:build": "tauri build --config desktop/src-tauri/tauri.conf.json",
+    "desktop:check": "tsc --noEmit -p desktop/tsconfig.json && cargo check --manifest-path desktop/src-tauri/Cargo.toml",
+    "desktop:vite:dev": "vite --config desktop/vite.config.ts --host 127.0.0.1",
+    "desktop:vite:build": "vite build --config desktop/vite.config.ts"
   },
   "dependencies": {
+    "@tauri-apps/api": "^2.12.4",
     "framer-motion": "^12.23.12",
+    "lucide-react": "^1.73.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.13",
+    "@tauri-apps/cli": "^2.12.4",
+    "@types/node": "^26.6.6",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^5.0.4",

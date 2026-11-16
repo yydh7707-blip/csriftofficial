@@ -1,0 +1,51 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CSRIFT",
+  "version": "0.1.0",
+  "identifier": "xyz.csrift.desktop",
+  "build": {
+    "beforeDevCommand": "npm run desktop:vite:dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run desktop:vite:build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "CSRIFT",
+        "width": 1440,
+        "height": 940,
+        "minWidth": 1060,
+        "minHeight": 700,
+        "center": true,
+        "resizable": true,
+        "decorations": false,
+        "shadow": true,
+        "backgroundColor": "#090a0c",
+        "dragDropEnabled": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "shortDescription": "Local-first PC control for CS2 players",
+    "category": "Utility",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "displayLanguageSelector": false,
+        "installMode": "currentUser",
+        "languages": ["English"]
+      }
+    }
+  }
+}
