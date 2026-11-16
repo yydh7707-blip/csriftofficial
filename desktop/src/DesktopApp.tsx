@@ -71,7 +71,7 @@ type InstalledSteamGame = { appId: number; installPath: string }
 type SteamAuthFlow = { flowId: string; pollSecret: string; loginUrl: string; expiresInSeconds: number }
 type SteamAuthPoll = { status: 'pending' | 'cancelled' | 'failed' | 'complete'; error?: string; profile?: SteamProfile }
 
-const STEAM_API_BASE = (import.meta.env.VITE_CSRIFT_API_URL || 'https://api.csrift.xyz').replace(/\/+$/, '')
+const STEAM_API_BASE = (import.meta.env.VITE_CSRIFT_API_URL || 'https://csrift-api.yydh7707.workers.dev').replace(/\/+$/, '')
 
 const steamErrors: Record<string, string> = {
   AUTH_CANCELLED: 'Steam 로그인이 취소되었습니다.',

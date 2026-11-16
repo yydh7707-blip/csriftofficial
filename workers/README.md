@@ -17,7 +17,9 @@ For local Steam callback testing, use the HTTPS tunnel URL printed by Wrangler a
 
 The production D1 database `csrift-production` is provisioned and migration `0001_init.sql` has been applied. The database binding and ID are in `workers/wrangler.jsonc`.
 
-The Worker bundle has been uploaded, but Cloudflare could not activate `api.csrift.xyz`: the domain currently uses Gabia nameservers and is not an active DNS zone in this Cloudflare account. Do not switch nameservers until the existing website and any mail/DNS records have been imported to Cloudflare. After the zone is active in this account, deploy again with `npm run api:deploy`; Wrangler will then provision the custom domain and certificate. Confirm `https://api.csrift.xyz/health` returns `{"ok":true}`.
+The Worker is deployed at `https://csrift-api.yydh7707.workers.dev` and uses that hostname for its Steam OpenID callback. The existing website remains on Render and its Gabia DNS has not been changed. Confirm the API responds at `https://csrift-api.yydh7707.workers.dev/health`.
+
+To move later to `api.csrift.xyz`, first add `csrift.xyz` as a Cloudflare zone, import and verify the existing Render, mail, and TXT DNS records, then update nameservers at Gabia only after reviewing the imported records. Set the Worker route and callback to the new hostname before deploying. Do not change nameservers until the existing records are verified.
 
 Steam sign-in also requires the site owner's Steam Web API key. Add it as a Cloudflare secret from the repository root:
 
@@ -25,7 +27,7 @@ Steam sign-in also requires the site owner's Steam Web API key. Add it as a Clou
 npx wrangler secret put STEAM_API_KEY --config workers/wrangler.jsonc
 ```
 
-Paste the key only into Wrangler's local prompt. Never put it in chat, frontend configuration, `.dev.vars.example`, or source control. The OpenID callback is fixed to `https://api.csrift.xyz/v1/auth/steam/callback`; Steam passwords are entered only on Steam Community.
+Paste the key only into Wrangler's local prompt. Never put it in chat, frontend configuration, `.dev.vars.example`, or source control. The OpenID callback is fixed to `https://csrift-api.yydh7707.workers.dev/v1/auth/steam/callback`; Steam passwords are entered only on Steam Community.
 
 ## Desktop Steam session
 
