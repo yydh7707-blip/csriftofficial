@@ -4,7 +4,7 @@ import {
   Check, CheckCircle2, ChevronDown, ChevronRight, CircleAlert, CircleHelp,
   Cpu, ExternalLink, FileArchive, FileClock, FileCog, FileSearch,
   Gauge, Gamepad2, HardDrive, HeartPulse, History, LayoutDashboard, LoaderCircle,
-  Maximize2, Minus, Monitor, MoreHorizontal, Network, Pencil, Plus, RefreshCw, RotateCcw,
+  Library, LogOut, Maximize2, Minus, Monitor, MoreHorizontal, Network, Pencil, Plus, RefreshCw, RotateCcw,
   Save, Search, Settings2, Shield, ShieldCheck, Sparkles, Square, Trash2,
   TriangleAlert, Wifi, X, Zap,
   type LucideIcon,
@@ -12,9 +12,10 @@ import {
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react'
+import { openUrl } from '@tauri-apps/plugin-opener'
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 
-type PageId = 'dashboard' | 'fps' | 'network' | 'monitor' | 'config' | 'optimize' | 'recovery' | 'settings'
+type PageId = 'dashboard' | 'library' | 'fps' | 'network' | 'monitor' | 'config' | 'optimize' | 'recovery' | 'settings'
 
 type SystemSnapshot = {
   osName: string | null
@@ -62,9 +63,78 @@ type ScanReport = { completedAtMs: number; durationMs: number; findings: ScanFin
 type DesktopSettings = { accent: 'ember' | 'amber'; reduceMotion: boolean; introEnabled: boolean; notificationsEnabled: boolean }
 type Toast = { id: number; title: string; message: string; tone: 'success' | 'error' | 'info' }
 type ActivityItem = { id: number; title: string; detail: string; time: number; tone: 'success' | 'info' }
+type SteamProfile = { steamId: string; personaName: string; avatarUrl: string | null; profileUrl: string }
+type SteamSession = { accessToken: string; expiresAt: number; profile: SteamProfile }
+type SteamGame = { appId: number; name: string; playtimeForeverMinutes: number; iconUrl: string | null }
+type SteamLibrary = { games: SteamGame[]; syncedAt: number; cached: boolean }
+type InstalledSteamGame = { appId: number; installPath: string }
+type SteamAuthFlow = { flowId: string; pollSecret: string; loginUrl: string; expiresInSeconds: number }
+type SteamAuthPoll = { status: 'pending' | 'cancelled' | 'failed' | 'complete'; error?: string; profile?: SteamProfile }
+
+const STEAM_API_BASE = (import.meta.env.VITE_CSRIFT_API_URL || 'https://api.csrift.xyz').replace(/\/+$/, '')
+
+const steamErrors: Record<string, string> = {
+  AUTH_CANCELLED: 'Steam 로그인이 취소되었습니다.',
+  AUTH_FAILED: 'Steam 인증에 실패했습니다. 다시 시도해 주세요.',
+  AUTH_RESPONSE_EXPIRED: 'Steam 인증 응답이 만료되었습니다. 다시 시도해 주세요.',
+  AUTH_FLOW_NOT_FOUND: '인증 요청이 만료되었습니다. 다시 연결해 주세요.',
+  AUTH_HANDOFF_UNAVAILABLE: '인증이 만료되었거나 이미 완료되었습니다. 다시 연결해 주세요.',
+  AUTH_HANDOFF_ALREADY_USED: '인증이 이미 처리되었습니다. 다시 연결해 주세요.',
+  INVALID_AUTH_RESPONSE: 'Steam 인증 응답을 확인할 수 없습니다. 다시 시도해 주세요.',
+  OPENID_VERIFICATION_FAILED: 'Steam에서 인증 응답을 확인하지 못했습니다.',
+  SESSION_EXPIRED: 'Steam 연결이 만료되었습니다. 다시 연결해 주세요.',
+  STEAM_API_KEY_MISSING: '서버에 Steam Web API 키가 아직 설정되지 않았습니다.',
+  STEAM_API_UNAVAILABLE: 'Steam 게임 목록을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.',
+  STEAM_LIBRARY_PRIVATE: 'Steam 게임 세부 정보가 비공개이거나 Steam에서 제공되지 않습니다. Steam 개인정보 설정에서 게임 세부 정보를 공개한 뒤 다시 동기화해 주세요.',
+  STEAM_PROFILE_UNAVAILABLE: 'Steam 프로필 정보를 불러오지 못했습니다.',
+  TOO_MANY_REQUESTS: '요청이 너무 많습니다. 잠시 기다린 뒤 다시 시도해 주세요.',
+}
+
+async function steamApiRequest<T>(path: string, accessToken?: string, init: RequestInit = {}): Promise<T> {
+  let response: Response
+  try {
+    response = await fetch(`${STEAM_API_BASE}${path}`, {
+      ...init,
+      headers: {
+        Accept: 'application/json',
+        ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        ...init.headers,
+      },
+    })
+  } catch {
+    throw new Error('CSRIFT 서버에 연결할 수 없습니다. 인터넷 연결이나 서버 배포 상태를 확인해 주세요.')
+  }
+  const payload = await response.json().catch(() => null) as { error?: string } | null
+  if (!response.ok) {
+    const code = payload?.error ?? (response.status === 401 ? 'SESSION_EXPIRED' : 'SERVICE_UNAVAILABLE')
+    throw new Error(steamErrors[code] ?? `CSRIFT 서버 요청에 실패했습니다 (${response.status}). 잠시 후 다시 시도해 주세요.`)
+  }
+  return payload as T
+}
+
+function waitForAuthPoll(delayMs: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException('Authentication cancelled', 'AbortError'))
+      return
+    }
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener('abort', abort)
+      resolve()
+    }, delayMs)
+    const abort = () => {
+      window.clearTimeout(timer)
+      signal.removeEventListener('abort', abort)
+      reject(new DOMException('Authentication cancelled', 'AbortError'))
+    }
+    signal.addEventListener('abort', abort, { once: true })
+  })
+}
 
 const navigation: { id: PageId; label: string; icon: LucideIcon; group: string }[] = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, group: 'OVERVIEW' },
+  { id: 'library', label: 'Game Library', icon: Library, group: 'PLAY' },
   { id: 'fps', label: 'FPS Center', icon: Gauge, group: 'PLAY' },
   { id: 'network', label: 'Network Lab', icon: Wifi, group: 'PLAY' },
   { id: 'monitor', label: 'System Monitor', icon: Activity, group: 'PLAY' },
@@ -76,6 +146,7 @@ const navigation: { id: PageId; label: string; icon: LucideIcon; group: string }
 
 const pageCopy: Record<PageId, { title: string; eyebrow: string; description: string }> = {
   dashboard: { title: 'Dashboard', eyebrow: 'YOUR ENVIRONMENT, AT A GLANCE', description: 'A clear view of your PC and CS2 setup. No synthetic scores, just the signals your hardware reports.' },
+  library: { title: 'Game Library', eyebrow: 'STEAM / OWNED GAMES', description: 'Browse games reported by Steam and keep ownership separate from local installation detection.' },
   fps: { title: 'FPS Center', eyebrow: 'FRAME DELIVERY / SYSTEM CONTEXT', description: 'Review CPU pressure, active processes, and the system signals around frame stability.' },
   network: { title: 'Network Lab', eyebrow: 'CONNECTION DIAGNOSTICS', description: 'Measure a real route from your PC. A public resolver is only a comparison point, not your CS2 server.' },
   monitor: { title: 'System Monitor', eyebrow: 'LIVE / LOCAL HARDWARE TELEMETRY', description: 'Follow available CPU, memory, process, and disk data directly from Windows.' },
@@ -119,12 +190,14 @@ function timeLabel(value: number): string {
 
 function useToasts(enabled: boolean) {
   const [toasts, setToasts] = useState<Toast[]>([])
+  const enabledRef = useRef(enabled)
+  enabledRef.current = enabled
   const notify = useCallback((title: string, message: string, tone: Toast['tone'] = 'info') => {
-    if (!enabled && tone !== 'error') return
+    if (!enabledRef.current && tone !== 'error') return
     const id = Date.now() + Math.random()
     setToasts((items) => [...items.slice(-3), { id, title, message, tone }])
     window.setTimeout(() => setToasts((items) => items.filter((item) => item.id !== id)), 4600)
-  }, [enabled])
+  }, [])
   const dismiss = useCallback((id: number) => setToasts((items) => items.filter((item) => item.id !== id)), [])
   return { toasts, notify, dismiss }
 }
@@ -171,10 +244,39 @@ function AppCard({ className = '', children }: { className?: string; children: R
   return <section className={`app-card ${className}`}>{children}</section>
 }
 
+function SteamConnectionCard({ profile, gameCount, loading, onConnect, onLibrary, onDisconnect }: {
+  profile: SteamProfile | null
+  gameCount: number | null
+  loading: boolean
+  onConnect: () => void
+  onLibrary: () => void
+  onDisconnect: () => void
+}) {
+  return (
+    <AppCard className={`steam-connection-card ${profile ? 'is-connected' : ''}`}>
+      <span className="steam-card-icon"><Gamepad2 size={19} /></span>
+      <div className="steam-card-copy">
+        <span className="eyebrow"><i /> STEAM / GAME LIBRARY</span>
+        <h3>{profile ? `CONNECTED TO STEAM · ${profile.personaName}` : 'Connect your Steam account.'}</h3>
+        <p>{profile ? `${profile.steamId} · ${gameCount == null ? 'Library has not been synced' : `${gameCount} games reported by Steam`}` : 'Connect your Steam account to discover your game library and manage your games with CSRIFT.'}</p>
+      </div>
+      {profile ? <>
+        <span className="steam-connected-pill"><i /> CONNECTED</span>
+        <button className="button button-outline" onClick={onLibrary} disabled={loading}><Library size={13} /> {loading ? 'SYNCING…' : 'OPEN LIBRARY'}</button>
+        <button className="steam-disconnect-button" onClick={onDisconnect}><LogOut size={13} /> DISCONNECT</button>
+      </> : <button className="button button-primary steam-connect-button" onClick={onConnect}><Gamepad2 size={15} /> CONNECT YOUR STEAM ACCOUNT <ArrowRight size={14} /></button>}
+    </AppCard>
+  )
+}
+
 function DashboardPage({
-  snapshot, history, latestPing, config, gameDetection, onPage, onGameDetection,
+  snapshot, history, latestPing, config, gameDetection, steamSession, steamLibrary,
+  steamLibraryLoading, onPage, onGameDetection, onConnectSteam, onOpenLibrary, onDisconnectSteam,
 }: {
-  snapshot: SystemSnapshot | null; history: number[]; latestPing: PingResult | null; config: ConfigStatus | null; gameDetection: GameDetection | null; onPage: (page: PageId) => void; onGameDetection: () => void
+  snapshot: SystemSnapshot | null; history: number[]; latestPing: PingResult | null; config: ConfigStatus | null; gameDetection: GameDetection | null
+  steamSession: SteamSession | null; steamLibrary: SteamLibrary | null; steamLibraryLoading: boolean
+  onPage: (page: PageId) => void; onGameDetection: () => void; onConnectSteam: () => void
+  onOpenLibrary: () => void; onDisconnectSteam: () => void
 }) {
   const systemClear = snapshot != null && snapshot.cpuUsagePercent != null && snapshot.cpuUsagePercent < 85 && snapshot.memoryUsagePercent != null && snapshot.memoryUsagePercent < 92
   return (
@@ -190,6 +292,15 @@ function DashboardPage({
         <EyeMark className="welcome-eye" />
         <div className="welcome-corner">EST. 2026&nbsp;&nbsp; / &nbsp;&nbsp; BUILD 0.1.0</div>
       </section>
+
+      <SteamConnectionCard
+        profile={steamSession?.profile ?? null}
+        gameCount={steamLibrary?.games.length ?? null}
+        loading={steamLibraryLoading}
+        onConnect={onConnectSteam}
+        onLibrary={onOpenLibrary}
+        onDisconnect={onDisconnectSteam}
+      />
 
       <div className="status-ribbon">
         <span className={`system-beacon ${systemClear ? 'is-good' : 'is-review'}`}><i /></span>
@@ -235,6 +346,71 @@ function DashboardPage({
       </div>
 
       <div className="micro-footnote"><span><i /> CPU / MEMORY / PROCESS DATA FROM WINDOWS</span><span>NO FPS PROMISES. JUST A CLEARER PICTURE.</span></div>
+    </div>
+  )
+}
+
+function SteamLibraryPage({ session, library, installedGames, installCheckComplete, installError, loading, error, onConnect, onSync, onDisconnect }: {
+  session: SteamSession | null
+  library: SteamLibrary | null
+  installedGames: InstalledSteamGame[]
+  installCheckComplete: boolean
+  installError: string | null
+  loading: boolean
+  error: string | null
+  onConnect: () => void
+  onSync: () => void
+  onDisconnect: () => void
+}) {
+  const [query, setQuery] = useState('')
+  const [sort, setSort] = useState<'name' | 'playtime'>('name')
+  const [installedOnly, setInstalledOnly] = useState(false)
+  const installedByAppId = useMemo(() => new Map(installedGames.map((game) => [game.appId, game])), [installedGames])
+  const filteredGames = useMemo(() => {
+    const search = query.trim().toLocaleLowerCase()
+    return [...(library?.games ?? [])]
+      .filter((game) => !search || game.name.toLocaleLowerCase().includes(search) || String(game.appId).includes(search))
+      .filter((game) => !installedOnly || !installCheckComplete || installedByAppId.has(game.appId))
+      .sort((left, right) => sort === 'name'
+        ? left.name.localeCompare(right.name)
+        : right.playtimeForeverMinutes - left.playtimeForeverMinutes)
+  }, [installedByAppId, installCheckComplete, installedOnly, library, query, sort])
+  const installedCount = library?.games.filter((game) => installedByAppId.has(game.appId)).length ?? 0
+
+  return (
+    <div className="page-stack">
+      <SectionTitle
+        overline="STEAM / OWNED GAMES"
+        title="Your library, on your terms."
+        detail="Steam ownership comes from your account. Local installation is verified separately on this PC."
+        action={session
+          ? <div className="toolbar-actions"><button className="button button-outline" onClick={onSync} disabled={loading}><RefreshCw size={13} className={loading ? 'spin' : ''} /> {loading ? 'SYNCING…' : 'SYNC LIBRARY'}</button><button className="button button-outline" onClick={onDisconnect}><LogOut size={13} /> DISCONNECT</button></div>
+          : <button className="button button-primary" onClick={onConnect}><Gamepad2 size={14} /> CONNECT YOUR STEAM ACCOUNT</button>}
+      />
+      {session && <AppCard className="library-account-card">
+        {session.profile.avatarUrl ? <img src={session.profile.avatarUrl} alt="" className="library-avatar" referrerPolicy="no-referrer" /> : <span className="library-avatar library-avatar-fallback"><Gamepad2 size={18} /></span>}
+        <div className="library-account-copy"><span className="steam-connected-pill"><i /> CONNECTED</span><b>{session.profile.personaName}</b><small>STEAM ID · {session.profile.steamId}</small></div>
+        <div className="library-account-stats"><span><b>{library?.games.length ?? '—'}</b><small>OWNED / REPORTED</small></span><span><b>{installCheckComplete ? installedCount : '—'}</b><small>{installCheckComplete ? 'DETECTED ON THIS PC' : 'LOCAL CHECK PENDING'}</small></span><span><b>{library ? new Date(library.syncedAt * 1000).toLocaleString() : '—'}</b><small>LAST SYNC</small></span></div>
+      </AppCard>}
+      {error && <div className="steam-library-error"><CircleAlert size={15} /><span>{error}</span><button className="text-button" onClick={onSync}>TRY AGAIN <ArrowRight size={13} /></button></div>}
+      {installError && <div className="steam-library-error"><CircleAlert size={15} /><span>{installError}</span></div>}
+      {!session
+        ? <AppCard className="library-empty"><Library size={27} /><h3>Connect Steam to view your games.</h3><p>Sign-in happens on Steam Community. Your Steam password is never entered into CSRIFT.</p><button className="button button-primary" onClick={onConnect}><Gamepad2 size={14} /> CONNECT YOUR STEAM ACCOUNT <ArrowRight size={14} /></button></AppCard>
+        : <AppCard className="library-games-card">
+          <div className="library-tools"><label className="library-search"><Search size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search games or App ID" aria-label="Search Steam games" /></label><label className="library-sort"><span>SORT</span><select value={sort} onChange={(event) => setSort(event.target.value as 'name' | 'playtime')}><option value="name">Name</option><option value="playtime">Play time</option></select></label><label className="library-installed-filter"><input type="checkbox" checked={installedOnly} disabled={!installCheckComplete} onChange={(event) => setInstalledOnly(event.target.checked)} /> INSTALLED ON THIS PC</label></div>
+          {loading && !library ? <div className="library-empty"><LoaderCircle size={20} className="spin" /><p>Loading your Steam library…</p></div>
+            : filteredGames.length ? <div className="library-game-grid">{filteredGames.map((game) => {
+              const installation = installedByAppId.get(game.appId)
+              const detectedCs2 = installCheckComplete && game.appId === 730 && installation != null
+              const playHours = Math.floor(game.playtimeForeverMinutes / 60)
+              const playMinutes = game.playtimeForeverMinutes % 60
+              return <article className="library-game-card" key={game.appId}>
+                <div className="library-game-art">{game.iconUrl ? <img src={game.iconUrl} alt="" loading="lazy" referrerPolicy="no-referrer" onError={(event) => { event.currentTarget.hidden = true }} /> : <Gamepad2 size={22} />}</div>
+                <div className="library-game-details"><h3 title={game.name}>{game.name}</h3><small>STEAM APP ID · {game.appId}</small><div className="library-game-tags"><span className="library-tag owned">OWNED</span><span className={`library-tag ${!installCheckComplete ? 'not-installed' : detectedCs2 ? 'detected' : installation ? 'installed' : 'not-installed'}`}>{!installCheckComplete ? 'LOCAL CHECK UNVERIFIED' : detectedCs2 ? 'DETECTED' : installation ? 'INSTALLED' : 'NOT INSTALLED'}</span><span className={`library-tag ${game.appId === 730 ? 'supported' : 'unsupported'}`}>{game.appId === 730 ? 'CS2 SUPPORTED' : 'NOT SUPPORTED'}</span></div><p>{installation ? installation.installPath : `${playHours}h ${playMinutes}m played · ${installCheckComplete ? 'Not detected in local Steam libraries' : 'Local installation not verified'}`}</p></div>
+              </article>
+            })}</div> : <div className="library-empty"><Library size={22} /><h3>{library?.games.length ? 'No games match this view.' : 'Steam reported an empty library.'}</h3><p>{installedOnly ? 'No owned games were detected as installed in this PC’s Steam libraries.' : 'Steam did not report any owned games for this account.'}</p></div>}
+          <p className="library-local-note"><ShieldCheck size={13} /> OWNED BY STEAM AND INSTALLED ON THIS PC ARE DIFFERENT STATES. CSRIFT ONLY MARKS VERIFIED LOCAL INSTALLATIONS.</p>
+        </AppCard>}
     </div>
   )
 }
@@ -422,14 +598,19 @@ function WindowControls() {
 }
 
 function BootIntro({ onSkip, reduceMotion }: { onSkip: () => void; reduceMotion: boolean }) {
-  return <motion.div className="boot-intro" initial={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: reduceMotion ? 0.15 : 0.5 }}><motion.div className="intro-eye" initial={{ opacity: 0, scale: .94, filter: 'blur(10px)' }} animate={{ opacity: .8, scale: 1, filter: 'blur(0px)' }} transition={{ duration: reduceMotion ? .15 : .65 }}><img src="/images/csrift-eyes-cutout.png" alt="" /></motion.div><motion.div className="intro-wordmark" initial={{ opacity: 0, y: 7, filter: 'blur(7px)' }} animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }} transition={{ delay: reduceMotion ? 0 : .3, duration: reduceMotion ? .15 : .45 }}><span>C</span><b>CSRIFT</b></motion.div><div className="intro-progress"><i /></div><button className="intro-skip" onClick={onSkip}>SKIP INTRO <ArrowRight size={13} /></button></motion.div>
+  return <motion.div className="boot-intro" initial={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: reduceMotion ? 0.15 : 0.42 }}><motion.div className="intro-eye" initial={{ opacity: 0, scale: reduceMotion ? 1 : .97, y: reduceMotion ? 0 : 7 }} animate={{ opacity: .9, scale: 1, y: 0 }} transition={{ duration: reduceMotion ? .12 : .42, ease: [0.22, 1, 0.36, 1] }}><img src="/images/csrift-eyes-cutout.png" alt="" fetchPriority="high" decoding="async" /></motion.div><motion.div className="intro-wordmark" initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: reduceMotion ? 0 : .16, duration: reduceMotion ? .12 : .28, ease: 'easeOut' }}><span>C</span><b>CSRIFT</b></motion.div><div className="intro-progress"><i /></div><button className="intro-skip" onClick={onSkip}>SKIP INTRO <ArrowRight size={13} /></button></motion.div>
 }
 
-function GameDetectionScreen({ detection, busy, progress, error, onFind, onPick, onContinue, onScan, onOptimize, reduceMotion }: {
+function GameDetectionScreen({ detection, busy, progress, error, steamProfile, onConnectSteam, onDisconnectSteam, onOpenLibrary, steamBusy, onFind, onPick, onContinue, onScan, onOptimize, reduceMotion }: {
   detection: GameDetection | null
   busy: boolean
   progress: ScanProgress | null
   error: string | null
+  steamProfile: SteamProfile | null
+  steamBusy: boolean
+  onConnectSteam: () => void
+  onDisconnectSteam: () => void
+  onOpenLibrary: () => void
   onFind: (path?: string) => Promise<void>
   onPick: () => Promise<void>
   onContinue: () => void
@@ -455,22 +636,66 @@ function GameDetectionScreen({ detection, busy, progress, error, onFind, onPick,
           {!posterUnavailable ? <img src="/assets/cs2-cover.png" alt="Counter-Strike 2 cover art" onError={() => setPosterUnavailable(true)} /> : <div className="poster-fallback-art"><span>730</span><b>CS2</b><i>COUNTER-STRIKE<br />GAME DETECTION</i><small>GAME ARTWORK NOT INCLUDED</small></div>}
           <span className="poster-index">CSRIFT / 730</span>
         </div>
-        <div className="game-card-meta"><span className={`game-state-tag ${detected ? 'detected' : detection ? 'not-found' : ''}`}><i />{busy ? 'SEARCHING' : detected ? '<DETECTED>' : detection ? 'NOT FOUND' : 'READY TO SEARCH'}</span><span className="eyebrow"><i /> STEAM APP ID / 730</span></div>
+        <div className="game-card-meta"><span className={`game-state-tag ${steamProfile ? 'detected' : ''}`}><i />{steamProfile ? 'STEAM CONNECTED' : 'STEAM / GAME LIBRARY'}</span><span className="eyebrow"><i /> STEAM APP ID / 730</span></div>
         <h2>COUNTER-STRIKE 2</h2>
-        <p className="game-detection-label">COUNTER-STRIKE GAME DETECTION</p>
+        <p className="game-detection-label">{steamProfile ? `CONNECTED AS ${steamProfile.personaName.toUpperCase()}` : 'CONNECT YOUR STEAM ACCOUNT'}</p>
         {detected && detection.installPath && <div className="detected-path"><span>VERIFIED INSTALLATION</span><code title={detection.installPath}>{detection.installPath}</code><small>{detection.configFiles.length} CS2 settings file{detection.configFiles.length === 1 ? '' : 's'} · {detection.libraryPaths.length} Steam librar{detection.libraryPaths.length === 1 ? 'y' : 'ies'} checked</small></div>}
         {busy && <div className="game-search-progress"><div className="game-search-label"><LoaderCircle size={13} className="spin" /><span>{progress?.step ?? 'SEARCHING FOR STEAM'}</span><b>{progress?.percent ?? 0}%</b></div><div className="progress-track"><div className="progress-fill" style={{ width: `${progress?.percent ?? 0}%` }} /></div></div>}
         {error && <p className="game-detection-error"><CircleAlert size={14} />{error}</p>}
         <div className="game-entry-actions">
-          {detected
-            ? <button className="button button-primary game-primary-action" onClick={onScan}><EyeMark /> SCAN NOW <ArrowRight size={15} /></button>
-            : <button className="button button-primary game-primary-action" onClick={() => void onFind()} disabled={busy}><Search size={16} /> {busy ? 'SEARCHING…' : 'FIND CS2'} <ArrowRight size={15} /></button>}
+          {steamProfile
+            ? <button className="button button-primary game-primary-action" onClick={onOpenLibrary}><Library size={15} /> OPEN GAME LIBRARY <ArrowRight size={15} /></button>
+            : <button className="button button-primary game-primary-action steam-connect-button" onClick={onConnectSteam} disabled={steamBusy}><Gamepad2 size={16} /> CONNECT YOUR STEAM ACCOUNT <ArrowRight size={15} /></button>}
+          <p className="steam-connect-explainer">Connect your Steam account to discover your game library and manage your games with CSRIFT.</p>
+          {steamProfile && <button className="button button-outline game-manual-action" onClick={onDisconnectSteam}><LogOut size={14} /> DISCONNECT STEAM ACCOUNT</button>}
+          {detected && <button className="button button-outline game-manual-action" onClick={onScan}><EyeMark /> SCAN CS2 SYSTEM</button>}
+          <button className="button button-outline game-manual-action" onClick={() => void onFind()} disabled={busy}><Search size={14} /> {busy ? 'SEARCHING…' : detected ? 'REFRESH LOCAL CS2 DETECTION' : 'FIND CS2 ON THIS PC'}</button>
           {!detected && <button className="button button-outline game-manual-action" onClick={() => void onPick()} disabled={busy}><ExternalLink size={14} /> SELECT INSTALLATION FOLDER</button>}
         </div>
         {detection && !detected && !busy && <button className="game-continue-link" onClick={onContinue}>CONTINUE WITHOUT CS2 <ArrowRight size={13} /></button>}
       </motion.section>
       <div className="game-entry-footer"><span>CSRIFT / LOCAL GAME CHECK</span><span>NO MEMORY ACCESS · NO INJECTION · NO ANTICHEAT INTERFERENCE</span></div>
     </motion.main>
+  )
+}
+
+type SteamAuthStage = 'preparing' | 'waiting' | 'verified' | 'error'
+
+function SteamConnectionOverlay({ stage, error, reduceMotion, onCancel, onRetry, onClose }: {
+  stage: SteamAuthStage
+  error: string | null
+  reduceMotion: boolean
+  onCancel: () => void
+  onRetry: () => void
+  onClose: () => void
+}) {
+  const connected = stage === 'verified'
+  return (
+    <motion.section className={`steam-auth-overlay ${connected ? 'is-connected' : ''}`} role="dialog" aria-modal="true" aria-label="Connect your Steam account" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: reduceMotion ? .1 : .28 }}>
+      <div className="steam-auth-grid" />
+      <motion.div className="steam-auth-card" initial={{ opacity: 0, y: reduceMotion ? 0 : 12, scale: reduceMotion ? 1 : .985 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={{ duration: reduceMotion ? .12 : .35 }}>
+        <span className="eyebrow"><i /> CSRIFT / STEAM OPENID</span>
+        <h1>{connected ? 'CONNECTED TO STEAM.' : stage === 'error' ? 'CONNECTION INTERRUPTED.' : 'CONNECT YOUR STEAM ACCOUNT.'}</h1>
+        <p>{connected ? 'Steam verified your account. Your library is ready to open.' : stage === 'error' ? 'Steam account connection was not completed.' : 'Sign in only on the official Steam Community page. CSRIFT never asks for or handles your Steam password.'}</p>
+        <div className={`steam-auth-connection ${connected ? 'is-connected' : ''}`}>
+          <div className="steam-auth-node"><span className="steam-auth-brand">C</span><small>CSRIFT</small></div>
+          <div className="steam-auth-link"><i /></div>
+          <div className="steam-auth-node steam-auth-node-steam"><span><Gamepad2 size={26} /></span><small>STEAM</small></div>
+        </div>
+        <div className={`steam-auth-status ${connected ? 'is-connected' : stage === 'error' ? 'is-error' : ''}`}>
+          {stage !== 'error' && <LoaderCircle size={13} className={connected ? '' : 'spin'} />}
+          {connected ? 'CONNECTED TO STEAM' : stage === 'error' ? 'SIGN-IN NOT COMPLETED' : stage === 'waiting' ? 'WAITING FOR STEAM CONFIRMATION' : 'PREPARING SECURE SIGN-IN'}
+        </div>
+        {error && <p className="steam-auth-error"><CircleAlert size={14} />{error}</p>}
+        <div className="steam-auth-actions">
+          {stage === 'error'
+            ? <><button className="button button-outline" onClick={onClose}>CLOSE</button><button className="button button-primary" onClick={onRetry}><RefreshCw size={14} /> RETRY</button></>
+            : connected
+              ? <button className="button button-primary" onClick={onClose}><Library size={14} /> OPEN GAME LIBRARY <ArrowRight size={14} /></button>
+              : <button className="button button-outline" onClick={onCancel}><X size={13} /> CANCEL CONNECTION</button>}
+        </div>
+      </motion.div>
+    </motion.section>
   )
 }
 
@@ -586,6 +811,17 @@ function DesktopApp() {
   const [detectionBusy, setDetectionBusy] = useState(false)
   const [detectionProgress, setDetectionProgress] = useState<ScanProgress | null>(null)
   const [detectionError, setDetectionError] = useState<string | null>(null)
+  const [steamSession, setSteamSession] = useState<SteamSession | null>(null)
+  const [steamLibrary, setSteamLibrary] = useState<SteamLibrary | null>(null)
+  const [steamInstalledGames, setSteamInstalledGames] = useState<InstalledSteamGame[]>([])
+  const [steamLibraryLoading, setSteamLibraryLoading] = useState(false)
+  const [steamLibraryError, setSteamLibraryError] = useState<string | null>(null)
+  const [steamInstallCheckComplete, setSteamInstallCheckComplete] = useState(false)
+  const [steamInstallError, setSteamInstallError] = useState<string | null>(null)
+  const [steamAuthStage, setSteamAuthStage] = useState<SteamAuthStage | null>(null)
+  const [steamAuthError, setSteamAuthError] = useState<string | null>(null)
+  const steamAuthAbortRef = useRef<AbortController | null>(null)
+  const steamAuthFlowRef = useRef<SteamAuthFlow | null>(null)
   const [hawkEyeVisible, setHawkEyeVisible] = useState(false)
   const [hawkEyeProgress, setHawkEyeProgress] = useState<ScanProgress>({ step: 'INITIALIZING SCAN', percent: 0 })
   const [hawkEyeReport, setHawkEyeReport] = useState<ScanReport | null>(null)
@@ -691,6 +927,163 @@ function DesktopApp() {
       setOptimizationLoading(false)
     }
   }, [notify])
+
+  const refreshSteamLibrary = useCallback(async (session: SteamSession | null = steamSession) => {
+    if (!session) return
+    setSteamLibraryLoading(true)
+    setSteamLibraryError(null)
+    setSteamInstallCheckComplete(false)
+    setSteamInstallError(null)
+    try {
+      const library = await steamApiRequest<SteamLibrary>('/v1/library', session.accessToken)
+      setSteamLibrary(library)
+      try {
+        const installed = await invoke<InstalledSteamGame[]>('detect_installed_steam_games', {
+          appIds: library.games.map((game) => game.appId),
+        })
+        setSteamInstalledGames(installed)
+        setSteamInstallCheckComplete(true)
+      } catch (error) {
+        setSteamInstalledGames([])
+        setSteamInstallError('Local Steam installation detection is unavailable. Installation status is not verified.')
+        notify('Local game detection unavailable', String(error), 'error')
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setSteamLibraryError(message)
+      if (message === steamErrors.SESSION_EXPIRED) {
+        setSteamSession(null)
+        setSteamLibrary(null)
+        setSteamInstalledGames([])
+        setSteamInstallCheckComplete(false)
+        setSteamInstallError(null)
+      }
+      notify('Steam library could not be loaded', message, 'error')
+    } finally {
+      setSteamLibraryLoading(false)
+    }
+  }, [notify, steamSession])
+
+  const startSteamConnection = useCallback(async () => {
+    const controller = new AbortController()
+    steamAuthAbortRef.current = controller
+    steamAuthFlowRef.current = null
+    setSteamAuthStage('preparing')
+    setSteamAuthError(null)
+    try {
+      const flow = await steamApiRequest<SteamAuthFlow>('/v1/auth/steam/start', undefined, {
+        method: 'POST',
+        body: '{}',
+        signal: controller.signal,
+      })
+      steamAuthFlowRef.current = flow
+      if (isTauri()) {
+        await openUrl(flow.loginUrl)
+      } else {
+        const popup = window.open(flow.loginUrl, '_blank', 'noopener,noreferrer')
+        if (!popup) throw new Error('Steam sign-in could not be opened. Allow pop-ups and retry.')
+      }
+      setSteamAuthStage('waiting')
+
+      const pollCount = Math.ceil((flow.expiresInSeconds * 1000) / 1400)
+      for (let attempt = 0; attempt < pollCount; attempt += 1) {
+        await waitForAuthPoll(1400, controller.signal)
+        const result = await steamApiRequest<SteamAuthPoll>('/v1/auth/steam/poll', undefined, {
+          method: 'POST',
+          body: JSON.stringify({ flowId: flow.flowId, pollSecret: flow.pollSecret }),
+          signal: controller.signal,
+        })
+        if (result.status === 'cancelled') throw new Error(steamErrors.AUTH_CANCELLED)
+        if (result.status === 'failed') throw new Error(steamErrors[result.error ?? 'AUTH_FAILED'] ?? steamErrors.AUTH_FAILED)
+        if (result.status !== 'complete') continue
+
+        const session = await steamApiRequest<SteamSession>('/v1/auth/steam/exchange', undefined, {
+          method: 'POST',
+          body: JSON.stringify({ flowId: flow.flowId, pollSecret: flow.pollSecret }),
+        })
+        if (controller.signal.aborted) {
+          try { await steamApiRequest('/v1/auth/logout', session.accessToken, { method: 'POST' }) } catch { /* The local sign-in was cancelled; the short-lived token expires if revocation is unavailable. */ }
+          return
+        }
+        setSteamSession(session)
+        setSteamAuthStage('verified')
+        setSteamAuthError(null)
+        setPage('library')
+        setEntryScreen(false)
+        notify('Steam account connected', `Signed in as ${session.profile.personaName}.`, 'success')
+        void refreshSteamLibrary(session)
+        return
+      }
+      throw new Error(steamErrors.AUTH_FLOW_NOT_FOUND)
+    } catch (error) {
+      if (controller.signal.aborted) {
+        setSteamAuthStage(null)
+        return
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      setSteamAuthError(message)
+      setSteamAuthStage('error')
+      notify('Steam connection was not completed', message, 'error')
+    } finally {
+      if (steamAuthAbortRef.current === controller) steamAuthAbortRef.current = null
+      steamAuthFlowRef.current = null
+    }
+  }, [notify, refreshSteamLibrary])
+
+  const cancelSteamConnection = useCallback(() => {
+    const flow = steamAuthFlowRef.current
+    steamAuthAbortRef.current?.abort()
+    steamAuthAbortRef.current = null
+    steamAuthFlowRef.current = null
+    setSteamAuthStage(null)
+    setSteamAuthError(null)
+    if (flow) {
+      void steamApiRequest('/v1/auth/steam/cancel', undefined, {
+        method: 'POST',
+        body: JSON.stringify({ flowId: flow.flowId, pollSecret: flow.pollSecret }),
+      }).catch((error: unknown) => notify('Could not cancel the Steam request', String(error), 'error'))
+    }
+  }, [notify])
+
+  const openSteamLibrary = useCallback(() => {
+    setEntryScreen(false)
+    setPage('library')
+    if (steamSession && !steamLibrary && !steamLibraryLoading) void refreshSteamLibrary(steamSession)
+  }, [refreshSteamLibrary, steamLibrary, steamLibraryLoading, steamSession])
+
+  const requestSteamDisconnect = useCallback(() => {
+    if (!steamSession) return
+    setConfirmAction({
+      title: 'Disconnect this Steam account?',
+      detail: 'CSRIFT will revoke its server session and clear the account and library data from this app session. Your Steam account and games are not changed.',
+      confirmLabel: 'REVOKE & DISCONNECT',
+      run: async () => {
+        try {
+          await steamApiRequest('/v1/auth/logout', steamSession.accessToken, { method: 'POST' })
+          setSteamSession(null)
+          setSteamLibrary(null)
+          setSteamInstalledGames([])
+          setSteamLibraryError(null)
+          setSteamInstallCheckComplete(false)
+          setSteamInstallError(null)
+          notify('Steam disconnected', 'The CSRIFT session was revoked. Your Steam account was not changed.', 'success')
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          if (message === steamErrors.SESSION_EXPIRED) {
+            setSteamSession(null)
+            setSteamLibrary(null)
+            setSteamInstalledGames([])
+            setSteamInstallCheckComplete(false)
+            setSteamInstallError(null)
+            setSteamLibraryError(null)
+            notify('Steam session expired', 'The expired CSRIFT session was cleared. Connect again whenever you want.', 'info')
+          } else {
+            notify('Steam could not be disconnected', message, 'error')
+          }
+        }
+      },
+    })
+  }, [notify, steamSession])
 
   useEffect(() => {
     try { localStorage.setItem(activityStorageKey, JSON.stringify(activity)) } catch { /* Activity stays available for this session. */ }
@@ -834,6 +1227,7 @@ function DesktopApp() {
 
   useEffect(() => {
     let active = true
+    let introTimer: number | undefined
     void (async () => {
       const [savedSettings, savedDataPath] = await Promise.all([
         invoke<DesktopSettings>('load_desktop_settings'),
@@ -843,22 +1237,23 @@ function DesktopApp() {
       setSettings(savedSettings)
       setDataPath(savedDataPath)
       setIntroEnabledOnBoot(savedSettings.introEnabled)
+      if (savedSettings.introEnabled) {
+        introTimer = window.setTimeout(() => { if (active) setBooting(false) }, savedSettings.reduceMotion ? 350 : 1250)
+      } else {
+        setBooting(false)
+      }
       await Promise.all([refreshSnapshot(true), refreshConfig(), refreshStartup(), refreshTempScan(true), refreshPowerPlan()])
       if (active) await detectGame()
-      if (active) {
-        if (savedSettings.introEnabled) {
-          window.setTimeout(() => { if (active) setBooting(false) }, savedSettings.reduceMotion ? 350 : 1450)
-        } else {
-          setBooting(false)
-        }
-      }
     })().catch((error: unknown) => {
       if (active) {
         notify('CSRIFT could not load local settings', String(error), 'error')
         setBooting(false)
       }
     })
-    return () => { active = false }
+    return () => {
+      active = false
+      if (introTimer != null) window.clearTimeout(introTimer)
+    }
   }, [detectGame, notify, refreshConfig, refreshPowerPlan, refreshSnapshot, refreshStartup, refreshTempScan])
 
   const runPing = async (target: string) => {
@@ -1006,7 +1401,8 @@ function DesktopApp() {
 
   const renderPage = () => {
     switch (page) {
-      case 'dashboard': return <DashboardPage snapshot={snapshot} history={telemetryHistory} latestPing={latestPing} config={configStatus} gameDetection={gameDetection} onPage={setPage} onGameDetection={() => setEntryScreen(true)} />
+      case 'dashboard': return <DashboardPage snapshot={snapshot} history={telemetryHistory} latestPing={latestPing} config={configStatus} gameDetection={gameDetection} steamSession={steamSession} steamLibrary={steamLibrary} steamLibraryLoading={steamLibraryLoading} onPage={setPage} onGameDetection={() => setEntryScreen(true)} onConnectSteam={() => { void startSteamConnection() }} onOpenLibrary={openSteamLibrary} onDisconnectSteam={requestSteamDisconnect} />
+      case 'library': return <SteamLibraryPage session={steamSession} library={steamLibrary} installedGames={steamInstalledGames} installCheckComplete={steamInstallCheckComplete} installError={steamInstallError} loading={steamLibraryLoading} error={steamLibraryError} onConnect={() => { void startSteamConnection() }} onSync={() => { void refreshSteamLibrary() }} onDisconnect={requestSteamDisconnect} />
       case 'fps': return <FpsPage snapshot={snapshot} history={telemetryHistory} onRefresh={() => void refreshSnapshot()} loading={loadingSnapshot} />
       case 'network': return <NetworkPage latestPing={latestPing} pingHistory={pingHistory} onPing={runPing} />
       case 'monitor': return <MonitorPage snapshot={snapshot} history={telemetryHistory} monitoring={monitoring} onToggle={() => setMonitoring((value) => !value)} onRefresh={() => void refreshSnapshot()} loading={loadingSnapshot} />
@@ -1025,7 +1421,7 @@ function DesktopApp() {
         <div className="titlebar-right"><span className="local-only-label"><i /> LOCAL SESSION</span><WindowControls /></div>
       </div>
 
-      {entryScreen ? <GameDetectionScreen detection={gameDetection} busy={detectionBusy} progress={detectionProgress} error={detectionError} onFind={detectGame} onPick={pickGameFolder} onContinue={() => setEntryScreen(false)} onScan={() => { void startHawkEyeScan() }} onOptimize={openOptimization} reduceMotion={motionDisabled} /> : <div className="app-layout">
+      {entryScreen ? <GameDetectionScreen detection={gameDetection} busy={detectionBusy} progress={detectionProgress} error={detectionError} steamProfile={steamSession?.profile ?? null} steamBusy={steamAuthStage !== null} onConnectSteam={() => { void startSteamConnection() }} onDisconnectSteam={requestSteamDisconnect} onOpenLibrary={openSteamLibrary} onFind={detectGame} onPick={pickGameFolder} onContinue={() => setEntryScreen(false)} onScan={() => { void startHawkEyeScan() }} onOptimize={openOptimization} reduceMotion={motionDisabled} /> : <div className="app-layout">
         <aside className="sidebar">
           <div className="sidebar-brand"><span className="brand-symbol">C</span><span><b>CSRIFT</b><small>PRECISION / CONTROL</small></span><span className="brand-presence"><i /></span></div>
           <div className="sidebar-rule" />
@@ -1055,6 +1451,7 @@ function DesktopApp() {
       </div>}
 
       <AnimatePresence>{booting && introEnabledOnBoot && <BootIntro reduceMotion={motionDisabled} onSkip={() => setBooting(false)} />}</AnimatePresence>
+      <AnimatePresence>{steamAuthStage && <SteamConnectionOverlay stage={steamAuthStage} error={steamAuthError} reduceMotion={motionDisabled} onCancel={cancelSteamConnection} onRetry={() => { void startSteamConnection() }} onClose={() => { setSteamAuthStage(null); openSteamLibrary() }} />}</AnimatePresence>
       <AnimatePresence>{hawkEyeVisible && <HawkEyeOverlay progress={hawkEyeProgress} report={hawkEyeReport} error={hawkEyeError} reduceMotion={motionDisabled} gameDetected={gameDetection?.detected === true} onCancel={() => { void cancelHawkEyeScan() }} onContinue={() => { setHawkEyeVisible(false); setEntryScreen(false) }} onLaunch={() => { void launchGame() }} onRetry={() => { void startHawkEyeScan() }} onOptimize={openOptimization} />}</AnimatePresence>
 
       <AnimatePresence>{optimizationOpen && <Cs2OptimizationPanel status={optimizationStatus} loading={optimizationLoading} busy={optimizationBusy} error={optimizationError} onClose={() => setOptimizationOpen(false)} onApply={(setting) => confirmOptimizationChange(setting)} onRestore={(setting) => confirmOptimizationChange(setting, true)} />}</AnimatePresence>

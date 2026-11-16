@@ -8,13 +8,16 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "desktop:dev": "tauri dev --config desktop/src-tauri/tauri.conf.json",
-    "desktop:build": "tauri build --config desktop/src-tauri/tauri.conf.json",
+    "desktop:build": "tauri build --config desktop/src-tauri/tauri.conf.json && node scripts/copy-desktop-installer.mjs",
     "desktop:check": "tsc --noEmit -p desktop/tsconfig.json && cargo check --manifest-path desktop/src-tauri/Cargo.toml",
     "desktop:vite:dev": "vite --config desktop/vite.config.ts --host 127.0.0.1",
-    "desktop:vite:build": "vite build --config desktop/vite.config.ts"
+    "desktop:vite:build": "vite build --config desktop/vite.config.ts",
+    "api:dev": "wrangler dev --config workers/wrangler.jsonc --ip 127.0.0.1 --port 8787",
+    "api:deploy": "wrangler deploy --config workers/wrangler.jsonc"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/plugin-opener": "^2.5.0",
     "framer-motion": "^12.23.12",
     "lucide-react": "^1.73.0",
     "react": "^19.1.1",
@@ -29,6 +32,7 @@
     "@vitejs/plugin-react": "^5.0.4",
     "tailwindcss": "^4.1.13",
     "typescript": "~5.9.2",
-    "vite": "^7.1.7"
+    "vite": "^7.1.7",
+    "wrangler": "^4.50.0"
   }
 }

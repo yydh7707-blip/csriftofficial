@@ -826,22 +826,40 @@ fn steam_libraries(steam_dirs: &[PathBuf]) -> Vec<PathBuf> {
     libraries
 }
 
-fn app_manifest_install_dir(library: &Path) -> Option<String> {
-    let manifest =
-        fs::read_to_string(library.join("steamapps").join("appmanifest_730.acf")).ok()?;
+fn parse_app_manifest_install_dir(manifest: &str, app_id: u32) -> Option<String> {
     let mut app_id_matches = false;
+    let mut is_installed = false;
     let mut install_dir = None;
     for line in manifest.lines() {
         let values = vdf_values(line);
         if values.len() >= 2 {
             match values[0].as_str() {
-                "appid" => app_id_matches = values[1] == "730",
+                "appid" => app_id_matches = values[1] == app_id.to_string(),
+                "StateFlags" => {
+                    is_installed = values[1].parse::<u32>().is_ok_and(|flags| flags & 4 != 0)
+                }
                 "installdir" => install_dir = Some(values[1].clone()),
                 _ => {}
             }
         }
     }
-    app_id_matches.then_some(install_dir).flatten()
+    (app_id_matches && is_installed)
+        .then_some(install_dir)
+        .flatten()
+}
+
+fn app_manifest_install_dir_for_app(library: &Path, app_id: u32) -> Option<String> {
+    let manifest = fs::read_to_string(
+        library
+            .join("steamapps")
+            .join(format!("appmanifest_{app_id}.acf")),
+    )
+    .ok()?;
+    parse_app_manifest_install_dir(&manifest, app_id)
+}
+
+fn app_manifest_install_dir(library: &Path) -> Option<String> {
+    app_manifest_install_dir_for_app(library, 730)
 }
 
 fn cs2_executable(path: &Path) -> Option<PathBuf> {
@@ -1092,6 +1110,73 @@ fn launch_cs2_game(app: AppHandle) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("Could not ask Steam to launch Counter-Strike 2: {error}"))
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstalledSteamGame {
+    app_id: u32,
+    install_path: String,
+}
+
+fn safe_steam_install_directory(value: &str) -> bool {
+    !value.trim().is_empty()
+        && Path::new(value).is_relative()
+        && Path::new(value)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+#[tauri::command]
+fn detect_installed_steam_games(app_ids: Vec<u32>) -> Result<Vec<InstalledSteamGame>, String> {
+    if app_ids.len() > 100_000 || app_ids.contains(&0) {
+        return Err("Steam game detection received an invalid App ID list.".to_string());
+    }
+    let app_ids = app_ids
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    if app_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let libraries = steam_libraries(&steam_directories());
+    let mut installed = Vec::new();
+    for library in libraries {
+        let steamapps = library.join("steamapps");
+        let entries = match fs::read_dir(&steamapps) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            let Some(app_id) = file_name
+                .strip_prefix("appmanifest_")
+                .and_then(|name| name.strip_suffix(".acf"))
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|app_id| app_ids.contains(app_id))
+            else {
+                continue;
+            };
+            let Ok(manifest) = fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Some(install_dir) = parse_app_manifest_install_dir(&manifest, app_id) else {
+                continue;
+            };
+            if !safe_steam_install_directory(&install_dir) {
+                continue;
+            }
+            let path = steamapps.join("common").join(install_dir);
+            if path.is_dir() {
+                installed.push(InstalledSteamGame {
+                    app_id,
+                    install_path: path.to_string_lossy().into_owned(),
+                });
+            }
+        }
+    }
+    installed.sort_by_key(|game| game.app_id);
+    installed.dedup_by_key(|game| game.app_id);
+    Ok(installed)
 }
 
 #[tauri::command]
@@ -2089,10 +2174,12 @@ fn open_local_data_folder(app: AppHandle) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .manage(ScanCancellation::default())
+        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_system_snapshot,
             detect_cs2_installation,
             launch_cs2_game,
+            detect_installed_steam_games,
             pick_cs2_installation_directory,
             run_hawk_eye_scan,
             cancel_hawk_eye_scan,
@@ -2126,8 +2213,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        has_cs2_launch_options, parse_ping_output, parse_steam_library_paths, vdf_values,
-        CS2_STEAM_APP_ID,
+        has_cs2_launch_options, parse_app_manifest_install_dir, parse_ping_output,
+        parse_steam_library_paths, safe_steam_install_directory, vdf_values, CS2_STEAM_APP_ID,
     };
 
     #[test]
@@ -2168,6 +2255,25 @@ mod tests {
             vdf_values("\"path\" \"E:\\\\Games\\\\Steam\""),
             vec!["path", r"E:\Games\Steam"]
         );
+    }
+
+    #[test]
+    fn only_reports_steam_manifests_marked_installed_for_the_requested_app() {
+        let installed = "\"AppState\"\n{\n  \"appid\" \"730\"\n  \"StateFlags\" \"4\"\n  \"installdir\" \"Counter-Strike Global Offensive\"\n}";
+        let updating = "\"AppState\"\n{\n  \"appid\" \"730\"\n  \"StateFlags\" \"2\"\n  \"installdir\" \"Counter-Strike Global Offensive\"\n}";
+        assert_eq!(
+            parse_app_manifest_install_dir(installed, 730).as_deref(),
+            Some("Counter-Strike Global Offensive")
+        );
+        assert_eq!(parse_app_manifest_install_dir(installed, 440), None);
+        assert_eq!(parse_app_manifest_install_dir(updating, 730), None);
+    }
+
+    #[test]
+    fn rejects_steam_install_directories_that_escape_the_library() {
+        assert!(safe_steam_install_directory("Counter-Strike 2"));
+        assert!(!safe_steam_install_directory("..\\outside"));
+        assert!(!safe_steam_install_directory("D:\\outside"));
     }
 
     #[test]

@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "csrift-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-16",
+  "workers_dev": true,
+  "routes": [
+    { "pattern": "api.csrift.xyz", "custom_domain": true }
+  ],
+  "vars": {
+    "PUBLIC_SITE_URL": "https://csrift.xyz",
+    "STEAM_OPENID_RETURN_URL": "https://api.csrift.xyz/v1/auth/steam/callback"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "csrift-production",
+      "database_id": "374dc394-436e-4838-912c-f4a260465a0c",
+      "migrations_dir": "migrations"
+    }
+  ]
+}
