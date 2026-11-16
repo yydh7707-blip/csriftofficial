@@ -122,14 +122,43 @@ function Intro() {
     return () => window.clearTimeout(timer)
   }, [show])
 
-  return <AnimatePresence>{show && <motion.div className="intro" initial={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.6 }} aria-hidden="true"><motion.img src="/images/csrift-eyes.png" alt="" initial={{ opacity: 0, scale: 1.04, filter: 'blur(10px)' }} animate={{ opacity: 0.45, scale: 1, filter: 'blur(0px)' }} transition={{ duration: 0.8 }} /><motion.div className="intro-mark" initial={{ opacity: 0, filter: 'blur(12px)', y: 8 }} animate={{ opacity: 1, filter: 'blur(0px)', y: 0 }} transition={{ delay: 0.25, duration: 0.65 }}><Wordmark /><span>CONTROL YOUR ENVIRONMENT</span></motion.div></motion.div>}</AnimatePresence>
+  return (
+    <AnimatePresence>
+      {show && (
+        <motion.div
+          className="intro"
+          initial={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.6 }}
+          aria-hidden="true"
+        >
+          <motion.img
+            src="/images/csrift-eyes-cutout.png"
+            alt=""
+            initial={{ opacity: 0, scale: 1.04, filter: 'blur(10px)' }}
+            animate={{ opacity: 0.45, scale: 1, filter: 'blur(0px)' }}
+            transition={{ duration: 0.8 }}
+          />
+          <motion.div
+            className="intro-mark"
+            initial={{ opacity: 0, filter: 'blur(12px)', y: 8 }}
+            animate={{ opacity: 1, filter: 'blur(0px)', y: 0 }}
+            transition={{ delay: 0.25, duration: 0.65 }}
+          >
+            <Wordmark />
+            <span>CONTROL YOUR ENVIRONMENT</span>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  )
 }
 
 function Hero() {
   const reduceMotion = useReducedMotion()
   return (
     <section className="hero" id="home">
-      <div className="hero-art" aria-hidden="true"><div className="hero-art-image"><img src="/images/csrift-eyes.png" alt="" /></div><div className="hero-glow" /><div className="hero-crosshair crosshair-one">+</div><div className="hero-crosshair crosshair-two">+</div></div>
+      <div className="hero-art" aria-hidden="true"><div className="hero-art-image"><img src="/images/csrift-eyes-cutout.png" alt="" /></div><div className="hero-glow" /><div className="hero-crosshair crosshair-one">+</div><div className="hero-crosshair crosshair-two">+</div></div>
       <div className="hero-content">
         <motion.div className="eyebrow hero-eyebrow" initial={{ opacity: 0, x: -16 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.3, duration: 0.6 }}><span className="eyebrow-mark" /> A CONTROL CENTER FOR CS2 PLAYERS</motion.div>
         <motion.h1 initial={reduceMotion ? false : { opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.42, duration: 0.7, ease: [0.22, 1, 0.36, 1] }}>TAKE CONTROL.<br /><span>OWN EVERY FRAME.</span></motion.h1>

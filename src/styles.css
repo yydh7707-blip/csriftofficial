@@ -49,7 +49,7 @@ a:hover .arrow-icon, button:hover .arrow-icon { transform: translate(2px, -1px);
 .hero::after { position: absolute; z-index: -1; inset: 0; background: linear-gradient(90deg, #080808 0%, rgba(8,8,8,.95) 26%, rgba(8,8,8,.66) 49%, rgba(8,8,8,.1) 100%), linear-gradient(0deg,#080808 0%,transparent 24%,transparent 80%,rgba(8,8,8,.45)); content: ""; }
 .hero-art { position: absolute; z-index: -2; inset: 0 0 0 24%; overflow: hidden; }
 .hero-art-image { position: absolute; inset: 8% -4% 5% 2%; animation: art-drift 12s ease-in-out infinite alternate; }
-.hero-art-image img { width: 100%; height: 100%; object-fit: contain; object-position: center right; }
+.hero-art-image img { width: 100%; height: 100%; object-fit: contain; object-position: center right; filter: drop-shadow(0 0 18px rgba(243,106,29,.22)) drop-shadow(0 0 54px rgba(243,106,29,.12)); mix-blend-mode: screen; }
 .hero-glow { position: absolute; inset: 20% 5% 2% 28%; background: radial-gradient(ellipse at 68% 58%, rgba(250,91,15,.16), transparent 49%); mix-blend-mode: screen; pointer-events: none; }
 .hero-content { width: min(1320px, calc(100% - 96px)); margin: 32px auto 0; padding-bottom: 32px; }
 .eyebrow { display: inline-flex; align-items: center; gap: 11px; color: #b7b2ab; font-size: 9px; font-weight: 700; letter-spacing: .18em; }
@@ -247,7 +247,7 @@ a:hover .arrow-icon, button:hover .arrow-icon { transform: translate(2px, -1px);
 
 .intro { position: fixed; z-index: 50; inset: 0; display: grid; place-items: center; overflow: hidden; background: #070707; }
 .intro::after { position: absolute; inset: 0; background: radial-gradient(ellipse at center,rgba(243,106,29,.11),transparent 48%); content: ""; }
-.intro > img { position: absolute; width: min(100vw, 1365px); height: min(100vh, 768px); object-fit: contain; opacity: .42; }
+.intro > img { position: absolute; width: min(100vw, 1365px); height: min(100vh, 768px); object-fit: contain; opacity: .42; filter: drop-shadow(0 0 30px rgba(243,106,29,.2)); mix-blend-mode: screen; }
 .intro-mark { position: relative; z-index: 1; display: flex; flex-direction: column; align-items: center; gap: 12px; }
 .intro-mark .wordmark { font-size: 26px; letter-spacing: .2em; }
 .intro-mark .wordmark-symbol { width: 34px; height: 34px; font-size: 26px; }
