@@ -350,17 +350,20 @@ function DashboardPage({
   )
 }
 
-function SteamLibraryPage({ session, library, installedGames, installCheckComplete, installError, loading, error, onConnect, onSync, onDisconnect }: {
+function SteamLibraryPage({ session, library, installedGames, installCheckComplete, installError, localLoading, localError, loading, error, onConnect, onSync, onDisconnect, onRefreshLocal }: {
   session: SteamSession | null
   library: SteamLibrary | null
   installedGames: InstalledSteamGame[]
   installCheckComplete: boolean
   installError: string | null
+  localLoading: boolean
+  localError: string | null
   loading: boolean
   error: string | null
   onConnect: () => void
   onSync: () => void
   onDisconnect: () => void
+  onRefreshLocal: () => void
 }) {
   const [query, setQuery] = useState('')
   const [sort, setSort] = useState<'name' | 'playtime'>('name')
@@ -387,6 +390,14 @@ function SteamLibraryPage({ session, library, installedGames, installCheckComple
           ? <div className="toolbar-actions"><button className="button button-outline" onClick={onSync} disabled={loading}><RefreshCw size={13} className={loading ? 'spin' : ''} /> {loading ? 'SYNCING…' : 'SYNC LIBRARY'}</button><button className="button button-outline" onClick={onDisconnect}><LogOut size={13} /> DISCONNECT</button></div>
           : <button className="button button-primary" onClick={onConnect}><Gamepad2 size={14} /> CONNECT YOUR STEAM ACCOUNT</button>}
       />
+      <AppCard className="local-steam-games">
+        <div className="card-heading"><div><span className="eyebrow"><i /> LOCAL / STEAM APP MANIFESTS</span><h3>Installed on this PC</h3></div><button className="button button-outline" onClick={onRefreshLocal} disabled={localLoading}><RefreshCw size={13} className={localLoading ? 'spin' : ''} /> {localLoading ? 'SCANNING…' : 'SCAN PC'}</button></div>
+        <p className="local-steam-description">Read-only scan of Steam library folders on this PC. This works independently of Steam sign-in and the Steam Web API.</p>
+        {localError ? <div className="steam-library-error"><CircleAlert size={14} />{localError}</div>
+          : localLoading && !installedGames.length ? <div className="local-steam-empty"><LoaderCircle size={15} className="spin" /> SCANNING STEAM LIBRARIES</div>
+            : installedGames.length ? <div className="local-steam-list">{installedGames.map((game) => <div className="local-steam-row" key={game.appId}><span className="local-steam-appid">APP {game.appId}</span><b>{game.appId === 730 ? 'COUNTER-STRIKE 2' : `STEAM GAME · ${game.appId}`}</b><code title={game.installPath}>{game.installPath}</code><span className={`library-tag ${game.appId === 730 ? 'supported' : 'unsupported'}`}>{game.appId === 730 ? 'CSRIFT SUPPORTED' : 'NOT SUPPORTED'}</span></div>)}</div>
+              : <div className="local-steam-empty"><HardDrive size={16} /> NO INSTALLED STEAM GAMES DETECTED</div>}
+      </AppCard>
       {session && <AppCard className="library-account-card">
         {session.profile.avatarUrl ? <img src={session.profile.avatarUrl} alt="" className="library-avatar" referrerPolicy="no-referrer" /> : <span className="library-avatar library-avatar-fallback"><Gamepad2 size={18} /></span>}
         <div className="library-account-copy"><span className="steam-connected-pill"><i /> CONNECTED</span><b>{session.profile.personaName}</b><small>STEAM ID · {session.profile.steamId}</small></div>
@@ -818,6 +829,8 @@ function DesktopApp() {
   const [steamLibraryError, setSteamLibraryError] = useState<string | null>(null)
   const [steamInstallCheckComplete, setSteamInstallCheckComplete] = useState(false)
   const [steamInstallError, setSteamInstallError] = useState<string | null>(null)
+  const [steamLocalGamesLoading, setSteamLocalGamesLoading] = useState(false)
+  const [steamLocalGamesError, setSteamLocalGamesError] = useState<string | null>(null)
   const [steamAuthStage, setSteamAuthStage] = useState<SteamAuthStage | null>(null)
   const [steamAuthError, setSteamAuthError] = useState<string | null>(null)
   const steamAuthAbortRef = useRef<AbortController | null>(null)
@@ -928,26 +941,32 @@ function DesktopApp() {
     }
   }, [notify])
 
+  const refreshLocalSteamGames = useCallback(async () => {
+    setSteamLocalGamesLoading(true)
+    setSteamLocalGamesError(null)
+    try {
+      setSteamInstalledGames(await invoke<InstalledSteamGame[]>('list_installed_steam_games'))
+    } catch (error) {
+      setSteamInstalledGames([])
+      setSteamLocalGamesError('Installed Steam games could not be checked on this PC.')
+      notify('Local Steam library scan unavailable', String(error), 'error')
+    } finally {
+      setSteamLocalGamesLoading(false)
+    }
+  }, [notify])
+
   const refreshSteamLibrary = useCallback(async (session: SteamSession | null = steamSession) => {
     if (!session) return
     setSteamLibraryLoading(true)
     setSteamLibraryError(null)
     setSteamInstallCheckComplete(false)
     setSteamInstallError(null)
+    const localGamesPromise = refreshLocalSteamGames()
     try {
       const library = await steamApiRequest<SteamLibrary>('/v1/library', session.accessToken)
       setSteamLibrary(library)
-      try {
-        const installed = await invoke<InstalledSteamGame[]>('detect_installed_steam_games', {
-          appIds: library.games.map((game) => game.appId),
-        })
-        setSteamInstalledGames(installed)
-        setSteamInstallCheckComplete(true)
-      } catch (error) {
-        setSteamInstalledGames([])
-        setSteamInstallError('Local Steam installation detection is unavailable. Installation status is not verified.')
-        notify('Local game detection unavailable', String(error), 'error')
-      }
+      await localGamesPromise
+      setSteamInstallCheckComplete(true)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       setSteamLibraryError(message)
@@ -962,7 +981,7 @@ function DesktopApp() {
     } finally {
       setSteamLibraryLoading(false)
     }
-  }, [notify, steamSession])
+  }, [notify, refreshLocalSteamGames, steamSession])
 
   const startSteamConnection = useCallback(async () => {
     const controller = new AbortController()
@@ -1242,7 +1261,7 @@ function DesktopApp() {
       } else {
         setBooting(false)
       }
-      await Promise.all([refreshSnapshot(true), refreshConfig(), refreshStartup(), refreshTempScan(true), refreshPowerPlan()])
+      await Promise.all([refreshSnapshot(true), refreshConfig(), refreshStartup(), refreshTempScan(true), refreshPowerPlan(), refreshLocalSteamGames()])
       if (active) await detectGame()
     })().catch((error: unknown) => {
       if (active) {
@@ -1254,7 +1273,7 @@ function DesktopApp() {
       active = false
       if (introTimer != null) window.clearTimeout(introTimer)
     }
-  }, [detectGame, notify, refreshConfig, refreshPowerPlan, refreshSnapshot, refreshStartup, refreshTempScan])
+  }, [detectGame, notify, refreshConfig, refreshLocalSteamGames, refreshPowerPlan, refreshSnapshot, refreshStartup, refreshTempScan])
 
   const runPing = async (target: string) => {
     const result = await invoke<PingResult>('run_ping_test', { target })
@@ -1402,7 +1421,7 @@ function DesktopApp() {
   const renderPage = () => {
     switch (page) {
       case 'dashboard': return <DashboardPage snapshot={snapshot} history={telemetryHistory} latestPing={latestPing} config={configStatus} gameDetection={gameDetection} steamSession={steamSession} steamLibrary={steamLibrary} steamLibraryLoading={steamLibraryLoading} onPage={setPage} onGameDetection={() => setEntryScreen(true)} onConnectSteam={() => { void startSteamConnection() }} onOpenLibrary={openSteamLibrary} onDisconnectSteam={requestSteamDisconnect} />
-      case 'library': return <SteamLibraryPage session={steamSession} library={steamLibrary} installedGames={steamInstalledGames} installCheckComplete={steamInstallCheckComplete} installError={steamInstallError} loading={steamLibraryLoading} error={steamLibraryError} onConnect={() => { void startSteamConnection() }} onSync={() => { void refreshSteamLibrary() }} onDisconnect={requestSteamDisconnect} />
+      case 'library': return <SteamLibraryPage session={steamSession} library={steamLibrary} installedGames={steamInstalledGames} installCheckComplete={steamInstallCheckComplete} installError={steamInstallError} localLoading={steamLocalGamesLoading} localError={steamLocalGamesError} loading={steamLibraryLoading} error={steamLibraryError} onConnect={() => { void startSteamConnection() }} onSync={() => { void refreshSteamLibrary() }} onDisconnect={requestSteamDisconnect} onRefreshLocal={() => { void refreshLocalSteamGames() }} />
       case 'fps': return <FpsPage snapshot={snapshot} history={telemetryHistory} onRefresh={() => void refreshSnapshot()} loading={loadingSnapshot} />
       case 'network': return <NetworkPage latestPing={latestPing} pingHistory={pingHistory} onPing={runPing} />
       case 'monitor': return <MonitorPage snapshot={snapshot} history={telemetryHistory} monitoring={monitoring} onToggle={() => setMonitoring((value) => !value)} onRefresh={() => void refreshSnapshot()} loading={loadingSnapshot} />

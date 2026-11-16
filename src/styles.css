@@ -290,7 +290,7 @@ a:hover .arrow-icon, button:hover .arrow-icon { transform: translate(2px, -1px);
   html { scroll-padding-top: 68px; }
   .site-header, .site-header.is-scrolled { height: 65px; }
   .header-inner { width: calc(100% - 40px); }
-  .desktop-nav, .header-download { display: none; }
+  .desktop-nav, .header-download, .header-steam-button { display: none; }
   .wordmark { font-size: 16px; }
   .wordmark-symbol { width: 22px; height: 22px; font-size: 17px; }
   .menu-toggle { width: 40px; height: 40px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; border: 1px solid rgba(255,255,255,.17); background: transparent; cursor: pointer; }
@@ -389,4 +389,51 @@ a:hover .arrow-icon, button:hover .arrow-icon { transform: translate(2px, -1px);
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
+
+.header-steam-button { min-height: 37px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 0 11px; border: 1px solid rgba(243,106,29,.48); background: rgba(243,106,29,.055); color: #f0e9e1; font-size: 8px; font-weight: 750; letter-spacing: .1em; white-space: nowrap; cursor: pointer; transition: border-color .2s ease,background .2s ease,color .2s ease; }
+.header-steam-button:hover:not(:disabled) { border-color: var(--orange); background: rgba(243,106,29,.13); color: #fff; }
+.header-steam-button:disabled { opacity: .6; cursor: wait; }
+.header-steam-button.is-connected { border-color: rgba(111,166,117,.38); color: #acd0a5; }
+.steam-online-dot { width: 5px; height: 5px; border-radius: 50%; background: #8bc28e; box-shadow: 0 0 8px rgba(139,194,142,.5); }
+.mobile-steam-connect { min-height: 50px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0; border: 0; border-bottom: 1px solid rgba(255,255,255,.09); background: transparent; color: #f0e8df; text-align: left; font-size: 10px; font-weight: 700; letter-spacing: .1em; cursor: pointer; }
+.mobile-steam-connect > svg { color: var(--orange); }
+.hero-actions > .button-primary { gap: 12px; }
+.steam-web-overlay { position: fixed; z-index: 80; inset: 0; display: grid; place-items: center; overflow: auto; padding: 22px; background: radial-gradient(ellipse at 50% 44%,rgba(196,83,23,.16),transparent 42%),rgba(5,6,8,.97); }
+.steam-web-overlay::before { position: fixed; inset: 0; opacity: .16; background-image: linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px); background-size: 36px 36px; mask-image: radial-gradient(ellipse at center,#000,transparent 78%); content: ""; pointer-events: none; }
+.steam-web-panel { position: relative; width: min(590px,100%); padding: clamp(24px,5vw,46px); border: 1px solid #34313a; background: linear-gradient(145deg,rgba(24,25,29,.98),rgba(12,14,17,.99)); box-shadow: 0 30px 110px rgba(0,0,0,.58),0 0 58px rgba(242,140,40,.06); }
+.steam-web-close { position: absolute; top: 15px; right: 15px; width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid rgba(255,255,255,.1); background: transparent; color: #9da2aa; cursor: pointer; }
+.steam-web-close:hover { border-color: rgba(243,106,29,.5); color: #fff; }
+.steam-web-panel > .eyebrow { color: #b99878; font-size: 8px; }
+.steam-web-panel > h2 { margin: 20px 0 0; color: #f0f1f3; font-family: var(--display); font-size: clamp(38px,7vw,56px); font-weight: 800; letter-spacing: -.015em; line-height: .91; }
+.steam-web-panel > h2 span { color: var(--orange); }
+.steam-web-panel > p { max-width: 470px; margin: 14px 0 0; color: #a09f9c; font-size: 11px; line-height: 1.75; }
+.steam-web-link-visual { display: grid; grid-template-columns: 90px minmax(70px,1fr) 90px; align-items: center; gap: 13px; margin: 34px 0 24px; }
+.steam-web-node { display: flex; flex-direction: column; align-items: center; gap: 8px; color: #8b9098; font-size: 7px; font-weight: 750; letter-spacing: .14em; }
+.steam-web-node > b,.steam-web-node > svg { width: 52px; height: 52px; display: grid; place-items: center; padding: 12px; border: 1px solid rgba(243,106,29,.42); background: rgba(243,106,29,.08); color: var(--amber); font-family: var(--display); font-size: 31px; box-shadow: 0 0 27px rgba(243,106,29,.09); }
+.steam-web-node.steam-web-steam > svg { border-color: #363b43; background: #171a20; color: #bac4d0; }
+.steam-web-line { position: relative; height: 1px; overflow: hidden; background: linear-gradient(90deg,rgba(243,106,29,.2),rgba(255,255,255,.08)); }
+.steam-web-line > i { position: absolute; inset: 0 auto 0 -35%; width: 35%; background: linear-gradient(90deg,transparent,#ffad52,transparent); box-shadow: 0 0 10px rgba(255,173,82,.7); animation: steam-web-travel 1.8s ease-in-out infinite; }
+.steam-web-link-visual.complete .steam-web-line { background: linear-gradient(90deg,rgba(243,106,29,.6),rgba(120,176,123,.7)); }
+.steam-web-link-visual.complete .steam-web-line > i { display: none; }
+.steam-web-link-visual.complete .steam-web-steam > svg { border-color: rgba(119,173,124,.5); color: #9dcc9e; box-shadow: 0 0 25px rgba(119,173,124,.12); }
+.steam-web-status { min-height: 20px; display: flex; align-items: center; gap: 8px; color: #e7b67f; font-size: 8px; font-weight: 750; letter-spacing: .12em; }
+.steam-web-status.has-error { color: #df9b8e; }
+.steam-web-spinner { animation: steam-web-spin 1.1s linear infinite; }
+.steam-web-error { color: #e0a095 !important; }
+.steam-web-account { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; color: #9dc79e; }
+.steam-web-account > span { display: flex; flex: 1; flex-direction: column; gap: 4px; }
+.steam-web-account b { font-size: 8px; letter-spacing: .1em; }
+.steam-web-account small { color: #d7dce0; font-size: 10px; letter-spacing: .08em; }
+.steam-web-account > a { display: inline-flex; align-items: center; gap: 5px; color: #9ea5ae; font-size: 7px; font-weight: 700; letter-spacing: .07em; }
+.steam-web-account > a .arrow-icon { color: var(--orange); }
+.steam-web-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 24px; }
+.steam-web-actions > .button { min-height: 40px; }
+.steam-web-note { padding-top: 12px; border-top: 1px solid rgba(255,255,255,.08); color: #878b91 !important; font-size: 9px !important; }
+@keyframes steam-web-travel { to { transform: translateX(390%); } }
+@keyframes steam-web-spin { to { transform: rotate(360deg); } }
+@media (max-width: 1020px) and (min-width: 761px) {
+  .header-inner { width: min(1320px,calc(100% - 48px)); }
+  .desktop-nav { gap: 17px; }
+  .header-steam-button { padding: 0 8px; font-size: 7px; }
 }

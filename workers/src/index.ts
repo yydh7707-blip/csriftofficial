@@ -186,34 +186,12 @@ async function authenticate(request: Request, env: Env): Promise<SessionRecord |
   return session
 }
 
-async function readSteamProfile(steamId: string, env: Env): Promise<SteamProfile> {
-  if (!env.STEAM_API_KEY) throw new ApiError('STEAM_API_KEY_MISSING', 503)
-  const url = new URL('https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/')
-  url.searchParams.set('key', env.STEAM_API_KEY)
-  url.searchParams.set('steamids', steamId)
-  const response = await fetch(url, { headers: { Accept: 'application/json' } })
-  if (!response.ok) throw new ApiError('STEAM_PROFILE_UNAVAILABLE', 502)
-  const payload = await response.json() as {
-    response?: { players?: Array<{ steamid?: string; personaname?: string; avatarfull?: string; profileurl?: string }> }
-  }
-  const player = payload.response?.players?.find((item) => item.steamid === steamId)
-  if (!player?.steamid || !player.personaname || !player.profileurl) {
-    throw new ApiError('STEAM_PROFILE_UNAVAILABLE', 502)
-  }
+function openIdSteamProfile(steamId: string): SteamProfile {
   return {
     steamId,
-    personaName: player.personaname.slice(0, 100),
-    avatarUrl: isHttpsUrl(player.avatarfull) ? player.avatarfull : null,
-    profileUrl: isHttpsUrl(player.profileurl) ? player.profileurl : `https://steamcommunity.com/profiles/${steamId}`,
-  }
-}
-
-function isHttpsUrl(value: unknown): value is string {
-  if (typeof value !== 'string') return false
-  try {
-    return new URL(value).protocol === 'https:'
-  } catch {
-    return false
+    personaName: 'Steam account',
+    avatarUrl: null,
+    profileUrl: `https://steamcommunity.com/profiles/${steamId}`,
   }
 }
 
@@ -368,26 +346,18 @@ async function finishSteamCallback(request: Request, env: Env): Promise<Response
     return html('Steam sign-in response already used', 'For your security, a Steam authentication response can only be used once.', 400)
   }
 
-  try {
-    const profile = await readSteamProfile(validated.steamId, env)
-    await persistSteamProfile(env, profile)
-    const handoffCode = randomToken()
-    const completed = await env.DB.prepare(
-      `UPDATE steam_auth_flows
-       SET status = 'complete', steam_id = ?, handoff_code = ?
-       WHERE flow_id = ? AND state_hash = ? AND status = 'pending' AND expires_at > ?`,
-    ).bind(validated.steamId, handoffCode, validated.flowId, flow.state_hash, now).run()
-    if (completed.meta.changes !== 1) {
-      return html('CSRIFT sign-in expired', 'Return to CSRIFT and start a new Steam connection.')
-    }
-    return html('Connected to Steam', `Steam confirmed the account ${profile.personaName}. Return to CSRIFT to finish connecting.`)
-  } catch (error) {
-    const code = error instanceof ApiError ? error.code : 'STEAM_PROFILE_UNAVAILABLE'
-    await env.DB.prepare(
-      "UPDATE steam_auth_flows SET status = 'failed', error_code = ? WHERE flow_id = ? AND status = 'pending'",
-    ).bind(code, validated.flowId).run()
-    return html('Steam profile could not be loaded', 'Authentication could not be completed because Steam profile information was unavailable. Return to CSRIFT and retry.', 502)
+  const profile = openIdSteamProfile(validated.steamId)
+  await persistSteamProfile(env, profile)
+  const handoffCode = randomToken()
+  const completed = await env.DB.prepare(
+    `UPDATE steam_auth_flows
+     SET status = 'complete', steam_id = ?, handoff_code = ?
+     WHERE flow_id = ? AND state_hash = ? AND status = 'pending' AND expires_at > ?`,
+  ).bind(validated.steamId, handoffCode, validated.flowId, flow.state_hash, now).run()
+  if (completed.meta.changes !== 1) {
+    return html('CSRIFT sign-in expired', 'Return to CSRIFT and start a new Steam connection.')
   }
+  return html('Connected to Steam', `Steam confirmed the account ID ${validated.steamId}. Return to CSRIFT to finish connecting.`)
 }
 
 async function checkSteamLogin(request: Request, env: Env): Promise<Response> {

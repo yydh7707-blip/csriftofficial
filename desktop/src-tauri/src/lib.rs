@@ -1180,6 +1180,28 @@ fn detect_installed_steam_games(app_ids: Vec<u32>) -> Result<Vec<InstalledSteamG
 }
 
 #[tauri::command]
+fn list_installed_steam_games() -> Result<Vec<InstalledSteamGame>, String> {
+    let mut app_ids = std::collections::HashSet::new();
+    for library in steam_libraries(&steam_directories()) {
+        let entries = match fs::read_dir(library.join("steamapps")) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if let Some(app_id) = file_name
+                .strip_prefix("appmanifest_")
+                .and_then(|name| name.strip_suffix(".acf"))
+                .and_then(|value| value.parse::<u32>().ok())
+            {
+                app_ids.insert(app_id);
+            }
+        }
+    }
+    detect_installed_steam_games(app_ids.into_iter().collect())
+}
+
+#[tauri::command]
 fn pick_cs2_installation_directory() -> Result<Option<String>, String> {
     #[cfg(target_os = "windows")]
     {
@@ -2180,6 +2202,7 @@ pub fn run() {
             detect_cs2_installation,
             launch_cs2_game,
             detect_installed_steam_games,
+            list_installed_steam_games,
             pick_cs2_installation_directory,
             run_hawk_eye_scan,
             cancel_hawk_eye_scan,
